@@ -42,7 +42,7 @@ models_test_run.log
 Thumbs.db
 
 # Misc
-image.png
 *.png
+!image.png
 *.jpg
 *.jpeg
