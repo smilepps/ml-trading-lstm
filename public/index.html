@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSTM — вероятность движения цены</title>
+<style>
+:root {
+  --bg: #0c0c0e;
+  --surface: #141416;
+  --surface-2: #19191c;
+  --surface-3: #1f1f23;
+  --border: #2b2a2f;
+  --border-soft: #232227;
+  --text: #eae7e1;
+  --muted: #a19c93;
+  --muted-2: #746f67;
+  --accent: #c8a96e;
+  --accent-strong: #dcc08a;
+  --accent-ink: #17130c;
+  --up: #6fbf94;
+  --down: #d47a72;
+  --warn: #d6a45f;
+  --train: #cdb68c;
+  --info: #b3ada3;
+  --debug: #706c65;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { color-scheme: dark; }
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background:
+    radial-gradient(1100px 520px at 18% -12%, rgba(200,169,110,0.08), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, rgba(120,110,95,0.05), transparent 55%),
+    var(--bg);
+  color: var(--text);
+  padding: 22px;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: rgba(200,169,110,0.28); color: #fff; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #302f34; border-radius: 8px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: #3d3b41; }
+h1 { display: flex; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: 600; margin-bottom: 14px; letter-spacing: 0.3px; }
+h1::before { content: ""; width: 3px; height: 18px; border-radius: 2px; background: linear-gradient(180deg, var(--accent-strong), var(--accent)); }
+#headTicker { color: var(--accent-strong); }
+.toolbar { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+.ticker-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ticker-bar select { min-width: 132px; }
+.ticker-add { display: flex; gap: 6px; align-items: center; margin-top: 7px; }
+.ticker-add input { width: 150px; }
+.ticker-title { color: var(--muted); font-size: 0.8rem; }
+.horizon-control { display: flex; align-items: center; gap: 7px; padding: 4px 10px; border: 1px solid var(--border-soft); border-radius: 9px; background: rgba(20,20,22,0.5); }
+.horizon-control label { margin: 0; white-space: nowrap; }
+.horizon-control input { width: 78px; text-align: center; }
+.btn { padding: 8px 14px; border: 1px solid var(--border); background: linear-gradient(180deg, #1b1b1f, #151517); color: var(--text); border-radius: 8px; cursor: pointer; font-size: 0.88rem; letter-spacing: 0.15px; transition: border-color 0.18s, background 0.18s, color 0.18s, transform 0.18s; }
+.btn:hover { border-color: rgba(200,169,110,0.55); background: #1d1d21; }
+.btn:active { transform: translateY(1px); }
+.btn.primary { background: linear-gradient(180deg, var(--accent-strong), var(--accent)); border-color: rgba(0,0,0,0.25); color: var(--accent-ink); font-weight: 600; }
+.btn.primary:hover { background: linear-gradient(180deg, #e6cd9c, #d2b57a); border-color: rgba(0,0,0,0.25); }
+.btn.danger { background: transparent; border-color: rgba(212,122,114,0.35); color: #d9938c; }
+.btn.danger:hover { background: rgba(212,122,114,0.1); border-color: rgba(212,122,114,0.6); }
+.btn.active { background: rgba(111,191,148,0.12); border-color: rgba(111,191,148,0.45); color: var(--up); }
+.btn.small { padding: 4px 9px; font-size: 0.76rem; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid rgba(200,169,110,0.45); outline-offset: 2px; }
+label { font-size: 0.84rem; color: var(--muted); margin-right: 6px; }
+select, input { padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font-size: 0.88rem; }
+select[multiple] { min-width: 240px; padding: 4px; }
+select option { padding: 5px 8px; border-radius: 5px; }
+select option:checked { background: #3a3325; color: var(--accent-strong); }
+a { color: var(--accent-strong); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+th, td { padding: 13px 15px; text-align: left; border-bottom: 1px solid var(--border-soft); font-size: 0.88rem; white-space: nowrap; }
+th { background: var(--surface-2); color: var(--muted); text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.9px; font-weight: 600; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: #1a1a1d; }
+tbody td:first-child { font-weight: 600; color: var(--accent-strong); letter-spacing: 0.2px; }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.85em; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+.flat { color: #b4a7c9; }
+.pill { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 0.76rem; font-weight: 700; letter-spacing: 0.3px; }
+.pill.up { background: rgba(111,191,148,0.1); color: var(--up); border: 1px solid rgba(111,191,148,0.28); }
+.pill.down { background: rgba(212,122,114,0.1); color: var(--down); border: 1px solid rgba(212,122,114,0.28); }
+.empty { text-align: center; padding: 30px; color: var(--muted); }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.72rem; background: var(--surface-3); color: var(--muted); margin-left: 6px; border: 1px solid transparent; }
+.badge.ok { background: rgba(111,191,148,0.1); color: var(--up); border-color: rgba(111,191,148,0.28); }
+.badge.err { background: rgba(212,122,114,0.1); color: var(--down); border-color: rgba(212,122,114,0.28); }
+.badge.warn { background: rgba(214,164,95,0.1); color: var(--warn); border-color: rgba(214,164,95,0.28); }
+.kv { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+.kv div { background: linear-gradient(180deg, #171719, #131315); border: 1px solid var(--border-soft); border-radius: 10px; padding: 9px 13px; min-width: 124px; }
+.kv .v { font-size: 1.08rem; font-weight: 600; color: var(--text); letter-spacing: 0.2px; }
+.kv .l { font-size: 0.72rem; color: var(--muted); display: block; margin-bottom: 3px; letter-spacing: 0.4px; text-transform: uppercase; }
+.small { font-size: 0.8rem; color: var(--muted); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+details.sample-wrap { margin-top: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+details.sample-wrap > summary { cursor: pointer; padding: 10px 14px; background: var(--surface-2); border-bottom: 1px solid transparent; font-size: 0.88rem; color: var(--text); letter-spacing: 0.2px; list-style: none; display: flex; align-items: center; gap: 8px; }
+details.sample-wrap > summary::-webkit-details-marker { display: none; }
+details.sample-wrap > summary::before { content: "▸"; color: var(--accent); font-size: 0.8rem; }
+details.sample-wrap[open] > summary { border-bottom-color: var(--border-soft); }
+details.sample-wrap[open] > summary::before { content: "▾"; }
+.sample-body { padding: 12px 14px; }
+.sample-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.sample-info { margin: 8px 0; line-height: 1.6; }
+.sample-block { margin-top: 12px; }
+.sample-block h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
+.sample-table { margin-top: 4px; }
+.sample-table th, .sample-table td { padding: 6px 9px; font-size: 0.75rem; }
+.sample-table td { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: #cfc9bf; }
+.log-wrap { margin-top: 16px; background: #0a0a0b; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.log-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 9px 13px; background: var(--surface-2); border-bottom: 1px solid var(--border-soft); font-size: 0.8rem; color: var(--muted); }
+.log-head strong { color: var(--text); font-size: 0.88rem; font-weight: 600; letter-spacing: 0.2px; }
+.log-head label { display: inline-flex; align-items: center; gap: 4px; margin: 0; cursor: pointer; }
+.log-head input { padding: 0; accent-color: var(--accent); }
+.log-head .spacer { margin-left: auto; }
+.log { padding: 11px 13px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.77rem; line-height: 1.5; color: #c7c2b9; height: 340px; overflow-y: auto; white-space: pre-wrap; }
+.log-line { display: flex; gap: 8px; align-items: baseline; border-bottom: 1px solid rgba(43,42,47,0.5); padding: 1px 0; }
+.log-line:hover { background: #141416; }
+.log-time { color: var(--muted-2); flex: 0 0 auto; }
+.log-level { flex: 0 0 48px; font-weight: 700; font-size: 0.66rem; letter-spacing: 0.6px; }
+.log-msg { white-space: pre-wrap; word-break: break-word; }
+.level-info .log-level { color: var(--info); }
+.level-train .log-level { color: var(--train); }
+.level-train .log-msg { color: #e6d8c1; }
+.level-warn .log-level { color: var(--warn); }
+.level-warn .log-msg { color: #e6c68f; }
+.level-error .log-level { color: var(--down); }
+.level-error .log-msg { color: #e6a09a; }
+.level-debug .log-level { color: var(--debug); }
+.level-debug .log-msg { color: var(--debug); }
+#log:not(.show-debug) .level-debug { display: none; }
+</style>
+</head>
+<body>
+
+<h1>LSTM — вероятность движения <span id="headTicker">—</span></h1>
+
+<div class="toolbar">
+  <div>
+    <div class="ticker-bar">
+      <label for="tickerSel">Тикер</label>
+      <select id="tickerSel"></select>
+      <button class="btn small danger" id="btnDeleteTicker" title="Удалить тикер, его свечи и модели">Удалить</button>
+    </div>
+    <div class="ticker-add">
+      <input id="newTicker" placeholder="Например, SBER" maxlength="32" autocomplete="off">
+      <button class="btn small" id="btnAddTicker">Добавить</button>
+      <span class="ticker-title" id="tickerTitle"></span>
+    </div>
+  </div>
+
+  <div>
+    <label for="intervals">Интервалы</label>
+    <select id="intervals" multiple size="4"></select>
+    <div style="margin-top:6px; display:flex; gap:6px;">
+      <button class="btn small" id="btnSelectAll">Все</button>
+      <button class="btn small" id="btnSelectNone">Ничего</button>
+    </div>
+  </div>
+
+  <div class="horizon-control">
+    <label for="horizonInput">Горизонт свечей</label>
+    <input type="number" id="horizonInput" min="5" max="25" step="1" value="10" title="От 5 до 25 свечей">
+    <span class="small">5–25</span>
+  </div>
+
+  <div class="actions">
+    <button class="btn" id="btnPredict">Прогноз</button>
+    <button class="btn" id="btnRefresh">Загрузить свечи</button>
+    <button class="btn primary" id="btnTrain">Обучить модели</button>
+    <button class="btn" id="btnMonitor">Монитор</button>
+  </div>
+</div>
+
+<div class="kv" style="margin-bottom:14px;">
+  <div><span class="l">Цена</span><span class="v" id="priceVal">—</span></div>
+  <div><span class="l">Последняя свеча</span><span class="v" id="lastCandleVal" style="font-size:0.9rem;">—</span></div>
+  <div><span class="l">Порог</span><span class="v" id="thresholdVal">±0.3%</span></div>
+  <div><span class="l">Горизонт</span><span class="v" id="horizonVal">10 свеч</span></div>
+  <div><span class="l">Вход</span><span class="v" id="inputVal">—</span></div>
+</div>
+
+<div class="kv" style="margin-bottom:14px;">
+  <div><span class="l">Обучение</span><span class="v badge" id="trainStatus">Готов</span></div>
+  <div><span class="l">Монитор</span><span class="v badge" id="monStatus">Выключен</span></div>
+  <div><span class="l">Свечи</span><span class="v badge" id="refreshStatus">Готовы</span></div>
+  <div><span class="l">Последнее обновление</span><span class="v" id="lastUpd" style="font-size:0.9rem;">—</span></div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>Интервал</th>
+      <th>Close</th>
+      <th>Свеча</th>
+      <th>P(Up <span id="thUp">≥0.3%</span>)</th>
+      <th>P(Down <span id="thDown">≤0.3%</span>)</th>
+      <th>Направление</th>
+      <th>Уверенность</th>
+      <th>Вход</th>
+      <th>Цель Up</th>
+      <th>Цель Down</th>
+      <th>Обновлён</th>
+      <th>Статус</th>
+    </tr>
+  </thead>
+  <tbody id="tblBody">
+  </tbody>
+</table>
+</div>
+
+<details class="sample-wrap">
+  <summary>Пример входной выборки — что реально уходит в модель</summary>
+  <div class="sample-body">
+    <div class="sample-controls">
+      <label for="sampleInterval">Интервал</label>
+      <select id="sampleInterval"></select>
+      <button class="btn small" id="btnSample">Показать</button>
+      <a class="btn small" id="sampleDownload" href="#" download>Скачать JSON</a>
+    </div>
+    <div class="sample-info small" id="sampleInfo">Нажмите «Показать», чтобы увидеть форму входа, признаки и первые строки окна.</div>
+    <div id="sampleRows"></div>
+  </div>
+</details>
+
+<div class="log-wrap">
+  <div class="log-head">
+    <strong>Подробный лог</strong>
+    <span id="logCount">0 строк</span>
+    <label><input type="checkbox" id="logDebug"> HTTP/debug</label>
+    <label><input type="checkbox" id="logAuto" checked> Автопрокрутка</label>
+    <span class="spacer"></span>
+    <button class="btn small" id="btnDownloadLog">Скачать</button>
+    <button class="btn small" id="btnClearLog">Очистить</button>
+  </div>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+const headTicker = document.getElementById('headTicker');
+const tickerSel = document.getElementById('tickerSel');
+const tickerTitle = document.getElementById('tickerTitle');
+const newTicker = document.getElementById('newTicker');
+const intervalsSel = document.getElementById('intervals');
+const tblBody = document.getElementById('tblBody');
+const logEl = document.getElementById('log');
+const logCountEl = document.getElementById('logCount');
+const logDebugEl = document.getElementById('logDebug');
+const logAutoEl = document.getElementById('logAuto');
+const btnTrain = document.getElementById('btnTrain');
+const btnMonitor = document.getElementById('btnMonitor');
+const btnRefresh = document.getElementById('btnRefresh');
+const btnPredict = document.getElementById('btnPredict');
+const btnAddTicker = document.getElementById('btnAddTicker');
+const btnDeleteTicker = document.getElementById('btnDeleteTicker');
+const btnClearLog = document.getElementById('btnClearLog');
+const btnDownloadLog = document.getElementById('btnDownloadLog');
+const btnSample = document.getElementById('btnSample');
+const btnSelectAll = document.getElementById('btnSelectAll');
+const btnSelectNone = document.getElementById('btnSelectNone');
+const sampleInterval = document.getElementById('sampleInterval');
+const sampleInfo = document.getElementById('sampleInfo');
+const sampleRows = document.getElementById('sampleRows');
+const sampleDownload = document.getElementById('sampleDownload');
+const trainStatus = document.getElementById('trainStatus');
+const monStatus = document.getElementById('monStatus');
+const refreshStatus = document.getElementById('refreshStatus');
+const lastUpd = document.getElementById('lastUpd');
+const priceVal = document.getElementById('priceVal');
+const lastCandleVal = document.getElementById('lastCandleVal');
+const inputVal = document.getElementById('inputVal');
+const horizonInput = document.getElementById('horizonInput');
+const horizonVal = document.getElementById('horizonVal');
+const thresholdVal = document.getElementById('thresholdVal');
+const thUp = document.getElementById('thUp');
+const thDown = document.getElementById('thDown');
+
+let TICKERS = [];
+let activeTicker = null;
+let INTERVALS = [];
+let selectedIntervals = [];
+let monitorRunning = null;
+let evtSrc = null;
+let trainPoll = null;
+let refreshPoll = null;
+let refreshWasRunning = false;
+let logLines = 0;
+let config = {
+  windowSize: 300,
+  features: 7,
+  featureNames: [],
+  horizon: 10,
+  horizonMin: 5,
+  horizonMax: 25,
+  threshold: 0.003
+};
+const predictionsMap = new Map();
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function timeOf(ts) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '--:--:--.---';
+  return d.toLocaleTimeString('ru-RU', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+
+function appendLog(line) {
+  if (!line || !line.msg) return;
+  const div = document.createElement('div');
+  div.className = `log-line level-${line.level || 'info'}`;
+  const t = document.createElement('span');
+  t.className = 'log-time';
+  t.textContent = timeOf(line.ts);
+  const l = document.createElement('span');
+  l.className = 'log-level';
+  const labels = { info: 'INFO', train: 'TRAIN', warn: 'WARN', error: 'ERROR', debug: 'DEBUG' };
+  l.textContent = labels[line.level] || 'INFO';
+  const m = document.createElement('span');
+  m.className = 'log-msg';
+  m.textContent = line.msg;
+  div.append(t, l, m);
+  logEl.appendChild(div);
+  logLines += 1;
+  logCountEl.textContent = `${logLines.toLocaleString('ru-RU')} строк`;
+  if (logAutoEl.checked) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function log(msg, level = 'info') {
+  appendLog({ ts: new Date().toISOString(), level, msg });
+}
+
+function setBadge(el, text, cls = '') {
+  el.textContent = text;
+  el.className = 'v badge' + (cls ? ' ' + cls : '');
+}
+
+async function fetchJson(url, options) {
+  const r = await fetch(url, options);
+  let data = null;
+  try { data = await r.json(); } catch (e) { /* ignore */ }
+  if (!r.ok) throw new Error(data?.error || `HTTP ${r.status}`);
+  return data;
+}
+
+function renderRow(p) {
+  const tr = document.createElement('tr');
+  const hasError = !!p.error;
+  const dirCls = p.direction === 'UP' ? 'up' : (p.direction === 'DOWN' ? 'down' : 'flat');
+  const hasPrice = Number.isFinite(Number(p.lastClose)) && Number(p.lastClose) > 0;
+  const threshold = Number.isFinite(Number(p.threshold)) ? Number(p.threshold) : config.threshold;
+  const upTarget = hasPrice ? (Number(p.lastClose) * (1 + threshold)).toFixed(2) : '—';
+  const downTarget = hasPrice ? (Number(p.lastClose) * (1 - threshold)).toFixed(2) : '—';
+  const updated = p.updatedAt ? timeOf(p.updatedAt) : '—';
+  const shortStatus = hasError ? (String(p.error).includes('Модель') ? 'Нет модели' : 'Ошибка') : 'OK';
+  const statusCls = hasError ? 'badge err' : 'badge ok';
+  const statusTitle = hasError ? esc(p.error) : 'Модель загружена';
+  const inputs = Number(p.inputs) || 1;
+  const contexts = Array.isArray(p.contexts) && p.contexts.length ? p.contexts.join('+') : 'нет';
+  const inputText = hasError ? '—' : `${inputs}×${p.window || config.windowSize}×${p.features || config.features} <span class="small">(${esc(contexts)})</span>`;
+
+  tr.innerHTML = `
+    <td><code>${esc(p.interval)}</code></td>
+    <td>${hasPrice ? Number(p.lastClose).toFixed(2) : '—'}</td>
+    <td class="small">${esc(p.lastBegin || '—')}</td>
+    <td>${Number.isFinite(Number(p.pUp)) ? (Number(p.pUp) * 100).toFixed(1) + '%' : '—'}</td>
+    <td>${Number.isFinite(Number(p.pDown)) ? (Number(p.pDown) * 100).toFixed(1) + '%' : '—'}</td>
+    <td><span class="pill ${dirCls}">${esc(p.direction || '—')}</span></td>
+    <td>${Number.isFinite(Number(p.confidence)) ? (Number(p.confidence) * 100).toFixed(1) + '%' : '—'}</td>
+    <td class="small">${inputText}</td>
+    <td class="small">${upTarget}</td>
+    <td class="small">${downTarget}</td>
+    <td class="small">${updated}</td>
+    <td><span class="${statusCls}" title="${statusTitle}">${esc(shortStatus)}</span></td>
+  `;
+  return tr;
+}
+
+function renderTable() {
+  const show = new Set(selectedIntervals);
+  tblBody.innerHTML = '';
+  let any = false;
+  for (const interval of INTERVALS) {
+    if (!show.has(interval)) continue;
+    const p = predictionsMap.get(interval);
+    if (!p) continue;
+    any = true;
+    tblBody.appendChild(renderRow(p));
+  }
+  if (!any) {
+    tblBody.innerHTML = '<tr><td colspan="12" class="empty">Нет данных для выбранных интервалов</td></tr>';
+  }
+}
+
+function syncSelected() {
+  selectedIntervals = Array.from(intervalsSel.selectedOptions).map(o => o.value).filter(Boolean);
+}
+
+function updateSummary() {
+  const first = selectedIntervals.map(i => predictionsMap.get(i)).find(p => p && !p.error);
+  if (first) {
+    priceVal.textContent = Number(first.lastClose).toFixed(2);
+    lastCandleVal.textContent = first.lastBegin || '—';
+  } else {
+    priceVal.textContent = '—';
+    lastCandleVal.textContent = '—';
+  }
+  const inputs = selectedIntervals
+    .map(i => predictionsMap.get(i))
+    .filter(p => p && !p.error && p.inputs);
+  if (inputs.length) {
+    const max = Math.max(...inputs.map(p => p.inputs));
+    const contexts = inputs.find(p => p.contexts && p.contexts.length)?.contexts || [];
+    inputVal.textContent = `${max}×${config.windowSize}×${config.features}` + (contexts.length ? ` (${contexts.join('+')})` : '');
+  } else {
+    inputVal.textContent = `${config.windowSize}×${config.features}`;
+  }
+}
+
+function updateTitles() {
+  const item = TICKERS.find(t => t.ticker === activeTicker);
+  headTicker.textContent = activeTicker || '—';
+  tickerTitle.textContent = item ? `${item.title || ''} · ${item.engine}/${item.market}` : '';
+  document.title = `LSTM — ${activeTicker || ''} — вероятность движения цены`;
+}
+
+async function loadTickers(preserveActive = true) {
+  try {
+    const data = await fetchJson('/api/tickers');
+    if (!Array.isArray(data)) throw new Error('некорректный ответ');
+    TICKERS = data;
+    const previous = preserveActive ? activeTicker : null;
+    tickerSel.innerHTML = '';
+    for (const t of data) {
+      const o = document.createElement('option');
+      o.value = t.ticker;
+      o.textContent = t.ticker + (t.title && t.title !== t.ticker ? ` — ${t.title}` : '');
+      tickerSel.appendChild(o);
+    }
+    const next = data.find(t => t.ticker === previous)?.ticker || data[0]?.ticker || null;
+    if (next) {
+      tickerSel.value = next;
+      if (next !== activeTicker) {
+        await selectTicker(next);
+      } else {
+        updateTitles();
+      }
+    }
+  } catch (e) {
+    log('Ошибка загрузки тикеров: ' + e.message, 'error');
+  }
+}
+
+async function loadConfig() {
+  try {
+    const c = await fetchJson('/api/config?ticker=' + encodeURIComponent(activeTicker || ''));
+    config = { ...config, ...c };
+    horizonInput.min = String(config.horizonMin);
+    horizonInput.max = String(config.horizonMax);
+    horizonInput.value = String(config.horizon);
+    horizonVal.textContent = `${config.horizon} свеч`;
+    thresholdVal.textContent = `±${percentLabel(config.threshold)}`;
+    thUp.textContent = `≥${percentLabel(config.threshold)}`;
+    thDown.textContent = `≤${percentLabel(config.threshold)}`;
+  } catch (e) {
+    log('Ошибка загрузки конфигурации: ' + e.message, 'error');
+  }
+}
+
+function currentHorizon() {
+  const value = Number(horizonInput.value);
+  if (!Number.isInteger(value) || value < config.horizonMin || value > config.horizonMax) {
+    throw new Error(`Горизонт должен быть целым числом от ${config.horizonMin} до ${config.horizonMax}`);
+  }
+  return value;
+}
+
+async function loadIntervals(preserveSelection = false) {
+  try {
+    const prev = preserveSelection ? new Set(selectedIntervals) : null;
+    const data = await fetchJson('/api/intervals?ticker=' + encodeURIComponent(activeTicker || ''));
+    if (!Array.isArray(data)) throw new Error(data.error || 'некорректный ответ');
+    INTERVALS = data.map(d => d.interval);
+    intervalsSel.innerHTML = '';
+    sampleInterval.innerHTML = '';
+    for (const d of data) {
+      const o = document.createElement('option');
+      o.value = d.interval;
+      const count = d.candles != null ? ` — ${Number(d.candles).toLocaleString('ru-RU')} свечей` : '';
+      const last = d.last ? `, до ${d.last}` : '';
+      o.textContent = `${d.interval}${count}${last}${d.hasModel ? '' : ' ⚠ нет модели'}`;
+      o.selected = prev ? prev.has(d.interval) : true;
+      intervalsSel.appendChild(o);
+
+      const so = document.createElement('option');
+      so.value = d.interval;
+      so.textContent = d.interval + (d.hasModel ? '' : ' (нет модели)');
+      sampleInterval.appendChild(so);
+    }
+    syncSelected();
+    if (!selectedIntervals.length && data.length) {
+      Array.from(intervalsSel.options).forEach(o => { o.selected = true; });
+      syncSelected();
+    }
+    for (const d of data) {
+      if (d.prediction) predictionsMap.set(d.interval, d.prediction);
+    }
+    if (sampleInterval.options.length) {
+      sampleInterval.value = selectedIntervals[0] || data[0].interval;
+    }
+    renderTable();
+    updateSummary();
+    log(`Интервалы ${activeTicker}: ${INTERVALS.join(', ')} (${INTERVALS.length})`, 'debug');
+  } catch (e) {
+    log('Ошибка загрузки интервалов: ' + e.message, 'error');
+  }
+}
+
+async function fetchPredict() {
+  if (!activeTicker) return;
+  if (!selectedIntervals.length) {
+    log('Не выбрано ни одного интервала', 'warn');
+    return;
+  }
+  try {
+    const url = '/api/predict?ticker=' + encodeURIComponent(activeTicker) +
+      '&intervals=' + encodeURIComponent(selectedIntervals.join(','));
+    const data = await fetchJson(url);
+    if (!Array.isArray(data)) throw new Error(data.error || 'некорректный ответ');
+    for (const p of data) predictionsMap.set(p.interval, p);
+    renderTable();
+    updateSummary();
+    lastUpd.textContent = new Date().toLocaleTimeString();
+    const ok = data.filter(d => !d.error).length;
+    log(`Прогноз ${activeTicker}: ${ok}/${data.length} интервалов рассчитано`);
+  } catch (e) {
+    log('Ошибка предсказания: ' + e.message, 'error');
+  }
+}
+
+async function selectTicker(ticker) {
+  if (!ticker) return;
+  activeTicker = ticker;
+  tickerSel.value = ticker;
+  predictionsMap.clear();
+  selectedIntervals = [];
+  updateTitles();
+  await loadConfig();
+  await loadIntervals(false);
+  await fetchPredict();
+  await loadSample();
+}
+
+async function loadLogs() {
+  try {
+    const data = await fetchJson('/api/logs?limit=500');
+    for (const line of data.logs || []) appendLog(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  } catch (e) {
+    log('Ошибка загрузки лога: ' + e.message, 'error');
+  }
+}
+
+async function train() {
+  if (!activeTicker) return;
+  if (!selectedIntervals.length) {
+    log('Выберите хотя бы один интервал для обучения', 'warn');
+    return;
+  }
+  let horizon;
+  try {
+    horizon = currentHorizon();
+  } catch (e) {
+    log(e.message, 'warn');
+    horizonInput.focus();
+    return;
+  }
+  btnTrain.disabled = true;
+  setBadge(trainStatus, 'Запуск…');
+  log(`Запуск обучения ${activeTicker}: ${selectedIntervals.join(', ')} | горизонт: ${horizon} свечей`);
+  try {
+    const res = await fetchJson('/api/train', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker: activeTicker, intervals: selectedIntervals.join(','), horizon })
+    });
+    if (!res.started) throw new Error(res.error || 'не удалось запустить обучение');
+    setBadge(trainStatus, 'Идёт обучение…', 'warn');
+    log(`Обучение запущено (pid=${res.pid}, горизонт=${res.horizon})`);
+    pollTrain();
+  } catch (e) {
+    log('Ошибка обучения: ' + e.message, 'error');
+    btnTrain.disabled = false;
+    setBadge(trainStatus, 'Ошибка', 'err');
+  }
+}
+
+async function refreshCandles() {
+  if (!activeTicker) return;
+  btnRefresh.disabled = true;
+  try {
+    const res = await fetchJson('/api/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker: activeTicker })
+    });
+    log(`Загрузка свечей ${activeTicker}: ${res.queued ? 'в очереди' : 'запущена'} (${res.mode})`);
+    pollRefresh();
+  } catch (e) {
+    log('Ошибка загрузки свечей: ' + e.message, 'error');
+    btnRefresh.disabled = false;
+  }
+}
+
+async function addTicker() {
+  const ticker = newTicker.value.trim().toUpperCase();
+  if (!ticker) {
+    log('Укажите тикер для добавления', 'warn');
+    newTicker.focus();
+    return;
+  }
+  btnAddTicker.disabled = true;
+  try {
+    const res = await fetchJson('/api/tickers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker })
+    });
+    log(`Добавлен ${res.ticker} — «${res.title || ''}» (${res.engine}/${res.market}); история загружается`);
+    newTicker.value = '';
+    await loadTickers(false);
+    tickerSel.value = res.ticker;
+    await selectTicker(res.ticker);
+    pollRefresh();
+  } catch (e) {
+    log('Не удалось добавить тикер: ' + e.message, 'error');
+  } finally {
+    btnAddTicker.disabled = false;
+  }
+}
+
+async function deleteTicker() {
+  if (!activeTicker) return;
+  if (!confirm(`Удалить тикер ${activeTicker}? Будут удалены свечи и модели.`)) return;
+  btnDeleteTicker.disabled = true;
+  try {
+    await fetchJson('/api/tickers/' + encodeURIComponent(activeTicker), { method: 'DELETE' });
+    log(`Тикер ${activeTicker} удалён`);
+    activeTicker = null;
+    await loadTickers(false);
+  } catch (e) {
+    log('Не удалось удалить тикер: ' + e.message, 'error');
+  } finally {
+    btnDeleteTicker.disabled = false;
+  }
+}
+
+async function toggleMonitor() {
+  if (monitorRunning) {
+    await fetchJson('/api/monitor/stop', { method: 'POST' });
+  } else {
+    await fetchJson('/api/monitor/start', { method: 'POST' });
+  }
+}
+
+async function refreshMonitorStatus() {
+  try {
+    const s = await fetchJson('/api/monitor/status');
+    const now = !!(s.enabled || s.running);
+    if (now !== monitorRunning) {
+      log('Монитор: ' + (now ? `включён (${s.sleepMs} мс)` : 'выключен'));
+    }
+    monitorRunning = now;
+    btnMonitor.textContent = monitorRunning ? 'Стоп монитор' : 'Монитор';
+    btnMonitor.className = monitorRunning ? 'btn active' : 'btn';
+    setBadge(monStatus, monitorRunning ? 'Работает' : 'Выключен', monitorRunning ? 'ok' : '');
+  } catch (e) { /* ignore */ }
+}
+
+async function pollRefresh() {
+  if (refreshPoll) return;
+  const tick = async () => {
+    try {
+      const s = await fetchJson('/api/refresh/status');
+      if (s.running && s.current) {
+        const c = s.current;
+        setBadge(refreshStatus, `${c.step}${c.currentTicker ? ': ' + c.currentTicker : ''}`, 'warn');
+        btnRefresh.disabled = true;
+        refreshWasRunning = true;
+        return;
+      }
+      clearInterval(refreshPoll);
+      refreshPoll = null;
+      btnRefresh.disabled = false;
+      setBadge(refreshStatus, 'Готовы', 'ok');
+      if (refreshWasRunning) {
+        refreshWasRunning = false;
+        log('Загрузка свечей завершена');
+        await loadTickers(true);
+        await loadConfig();
+        await loadIntervals(true);
+        await fetchPredict();
+        await loadSample();
+      }
+    } catch (e) { /* ignore */ }
+  };
+  refreshPoll = setInterval(tick, 2000);
+  await tick();
+}
+
+function percentLabel(value) {
+  const pct = Number(value) * 100;
+  return `${Number.isFinite(pct) ? pct.toFixed(1) : '0.3'}%`;
+}
+
+async function loadSample() {
+  if (!activeTicker || !sampleInterval.value) return;
+  const interval = sampleInterval.value;
+  sampleInfo.textContent = 'Загрузка…';
+  sampleRows.innerHTML = '';
+  try {
+    const s = await fetchJson(`/api/sample?ticker=${encodeURIComponent(activeTicker)}&interval=${encodeURIComponent(interval)}`);
+    const shape = Object.entries(s.shape || {}).map(([k, v]) => `${k}: ${v[0]}×${v[1]}`).join(' | ');
+    sampleInfo.innerHTML = `
+      <b>${esc(s.ticker)} ${esc(s.interval)}</b> · окно ${esc(s.window)} · горизонт ${esc(s.horizon)} · порог ${percentLabel(s.threshold)} · порядок: <code>${esc(s.order)}</code><br>
+      Форма входа: <code>${esc(shape)}</code> · контексты: <code>${esc((s.contexts || []).join(', ') || 'нет')}</code><br>
+      Признаки (${s.featureNames.length}): ${s.featureNames.map((n, i) => `<code title="${esc(s.featureDescriptions[n] || '')}">${esc(n)}</code>`).join(', ')}
+    `;
+    sampleDownload.href = s.download;
+    const blocks = [['base', 'base — текущий интервал'], ['h1', 'h1 — первый старший'], ['h2', 'h2 — второй старший']];
+    for (const [key, title] of blocks) {
+      const rows = s.rows[key];
+      if (!rows || !rows.length) continue;
+      const wrap = document.createElement('div');
+      wrap.className = 'sample-block';
+      const h = document.createElement('h3');
+      h.textContent = `${title} · первые 3 строки (текущая → история)`;
+      const table = document.createElement('table');
+      table.className = 'sample-table';
+      const thead = document.createElement('thead');
+      thead.innerHTML = '<tr><th>#</th>' + s.featureNames.map(n => `<th>${esc(n)}</th>`).join('') + '</tr>';
+      const tbody = document.createElement('tbody');
+      rows.forEach((row, idx) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + idx + '</td>' + row.map(v => `<td>${Number(v).toFixed(4)}</td>`).join('');
+        tbody.appendChild(tr);
+      });
+      table.append(thead, tbody);
+      wrap.append(h, table);
+      sampleRows.appendChild(wrap);
+    }
+    log(`Пример входа ${activeTicker} ${interval}: ${shape}`, 'debug');
+  } catch (e) {
+    sampleInfo.textContent = e.message;
+    sampleDownload.removeAttribute('href');
+  }
+}
+
+btnTrain.addEventListener('click', train);
+btnRefresh.addEventListener('click', refreshCandles);
+btnPredict.addEventListener('click', fetchPredict);
+btnAddTicker.addEventListener('click', addTicker);
+btnDeleteTicker.addEventListener('click', deleteTicker);
+newTicker.addEventListener('keydown', e => { if (e.key === 'Enter') addTicker(); });
+btnSample.addEventListener('click', loadSample);
+sampleInterval.addEventListener('change', loadSample);
+btnSelectAll.addEventListener('click', () => {
+  Array.from(intervalsSel.options).forEach(o => { o.selected = true; });
+  syncSelected();
+  renderTable();
+  updateSummary();
+  log('Выбраны все интервалы: ' + selectedIntervals.join(', '));
+  fetchPredict();
+});
+btnSelectNone.addEventListener('click', () => {
+  Array.from(intervalsSel.options).forEach(o => { o.selected = false; });
+  syncSelected();
+  renderTable();
+  updateSummary();
+  log('Все интервалы сняты', 'warn');
+});
+tickerSel.addEventListener('change', () => {
+  selectTicker(tickerSel.value);
+});
+btnMonitor.addEventListener('click', async () => {
+  try {
+    await toggleMonitor();
+    await refreshMonitorStatus();
+  } catch (e) {
+    log('Ошибка монитора: ' + e.message, 'error');
+  }
+});
+logDebugEl.addEventListener('change', () => {
+  logEl.classList.toggle('show-debug', logDebugEl.checked);
+  if (logDebugEl.checked) logEl.scrollTop = logEl.scrollHeight;
+});
+btnClearLog.addEventListener('click', () => {
+  logEl.innerHTML = '';
+  logLines = 0;
+  logCountEl.textContent = '0 строк';
+});
+btnDownloadLog.addEventListener('click', () => {
+  const text = Array.from(logEl.querySelectorAll('.log-line')).map(el => el.textContent).join('\n');
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `dashboard-log-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+
+intervalsSel.addEventListener('change', () => {
+  syncSelected();
+  renderTable();
+  updateSummary();
+  log('Выбраны интервалы: ' + (selectedIntervals.join(', ') || '—'));
+  fetchPredict();
+});
+
+// SSE поток для реального времени
+function openStream() {
+  if (evtSrc) return;
+  evtSrc = new EventSource('/stream');
+  evtSrc.onmessage = (e) => {
+    try {
+      const m = JSON.parse(e.data);
+      if (m.type === 'log') {
+        appendLog(m.line);
+      } else if (m.type === 'prediction' && m.data) {
+        if (m.ticker === activeTicker) {
+          predictionsMap.set(m.interval, m.data);
+          renderTable();
+          updateSummary();
+          lastUpd.textContent = new Date().toLocaleTimeString();
+        }
+      } else if (m.type === 'train_done') {
+        log(`Обучение ${m.ticker} завершено (code=${m.code})`, m.code === 0 ? 'info' : 'error');
+        if (m.ticker === activeTicker) {
+          loadConfig().then(() => loadIntervals(true)).then(fetchPredict).then(loadSample);
+        }
+      } else if (m.type === 'refresh_done') {
+        log(`Загрузка свечей завершена: ${(m.tickers || []).join(', ')} (code=${m.code})`, m.code === 0 ? 'info' : 'error');
+      } else if (m.type === 'refresh_status') {
+        const s = m.data;
+        if (s.running && s.current) {
+          setBadge(refreshStatus, `${s.current.step}${s.current.currentTicker ? ': ' + s.current.currentTicker : ''}`, 'warn');
+        } else {
+          setBadge(refreshStatus, 'Готовы', 'ok');
+        }
+      } else if (m.type === 'tickers_changed') {
+        loadTickers(true);
+      }
+    } catch (err) { /* ignore */ }
+  };
+  evtSrc.onerror = () => { evtSrc.close(); evtSrc = null; setTimeout(openStream, 3000); };
+}
+
+// Обучение в фоне — проверяем статус через API
+function pollTrain() {
+  if (trainPoll) return;
+  trainPoll = setInterval(async () => {
+    try {
+      const s = await fetchJson('/api/train/status');
+      if (s.running) {
+        setBadge(trainStatus, s.progress ? `Эпоха ${s.progress.epoch}/${s.progress.epochs}` : 'Идёт обучение…', 'warn');
+        btnTrain.disabled = true;
+        return;
+      }
+      clearInterval(trainPoll);
+      trainPoll = null;
+      btnTrain.disabled = false;
+      setBadge(trainStatus, s.code === 0 ? 'Готов' : 'Ошибка', s.code === 0 ? 'ok' : 'err');
+      log(`Обучение завершено (code=${s.code})`, s.code === 0 ? 'info' : 'error');
+      await loadTickers(true);
+      await loadConfig();
+      await loadIntervals(true);
+      await fetchPredict();
+      await loadSample();
+    } catch (e) { /* ignore */ }
+  }, 2000);
+}
+
+async function checkRunningJobs() {
+  try {
+    const s = await fetchJson('/api/train/status');
+    if (s.running) {
+      btnTrain.disabled = true;
+      setBadge(trainStatus, s.progress ? `Эпоха ${s.progress.epoch}/${s.progress.epochs}` : 'Идёт обучение…', 'warn');
+      pollTrain();
+    }
+  } catch (e) { /* ignore */ }
+  try {
+    const r = await fetchJson('/api/refresh/status');
+    if (r.running) {
+      refreshWasRunning = true;
+      btnRefresh.disabled = true;
+      pollRefresh();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// Инициализация
+(async () => {
+  await loadLogs();
+  await loadTickers(false);
+  await refreshMonitorStatus();
+  await checkRunningJobs();
+  openStream();
+  setInterval(refreshMonitorStatus, 5000);
+})();
+</script>
+</body>
+</html>

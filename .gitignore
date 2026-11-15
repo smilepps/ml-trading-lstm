@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment
+.env
+
+# Models and data
+models/
+models_test/
+*.onnx
+*.pkl
+*.npy
+*.npz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Logs
+*.log
+server.log
+confidence_v4.log
+train_*.log
+models_test_run.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+image.png
+*.png
+*.jpg
+*.jpeg
