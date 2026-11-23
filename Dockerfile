@@ -2,7 +2,9 @@ FROM node:26-bookworm-slim
 
 ENV PYTHON=/opt/venv/bin/python \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOST=0.0.0.0 \
+    PORT=3000
 
 WORKDIR /app
 

@@ -3,6 +3,36 @@ const assert = require('node:assert/strict');
 
 const refresh = require('../refresh_data');
 
+test('loadRange дедуплицирует ревизии и сохраняет пачку одним атомарным запросом', async () => {
+  const originalFetch = global.fetch;
+  const queries = [];
+  const client = { async query(sql, params) { queries.push({ sql, params }); return { rows: [] }; } };
+  global.fetch = async () => ({ ok: true, json: async () => ({
+    candles: {
+      columns: ['begin', 'open', 'close', 'high', 'low', 'value', 'volume'],
+      data: [
+        ['2025-01-10 10:00:00', 1, 2, 3, 1, 10, 5],
+        ['2025-01-10 10:00:00', 2, 3, 4, 1, 11, 6],
+        ['2025-01-10 10:01:00', 3, 4, 5, 2, 12, 7],
+      ],
+    },
+  }) });
+  try {
+    const saved = await refresh.loadRange(client, 'SBER', 'https://example.invalid/candles',
+      '2025-01-10', '2025-01-10', 1, '1m', { progress: false, quiet: true });
+    assert.equal(saved, 2);
+    assert.equal(queries.length, 1);
+    assert.match(queries[0].sql, /WITH incoming AS[\s\S]*UPDATE candles AS c[\s\S]*RETURNING[\s\S]*INSERT INTO candles/);
+    assert.match(queries[0].sql, /WHERE NOT EXISTS[\s\S]*FROM updated/);
+    assert.match(queries[0].sql, /ON CONFLICT \(ticker, interval, begin\) DO UPDATE/);
+    assert.deepEqual(queries[0].params[2], ['2025-01-10 10:00:00', '2025-01-10 10:01:00']);
+    assert.deepEqual(queries[0].params[3], [2, 3]);
+    assert.deepEqual(queries[0].params[4], [3, 4]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 function at(hour, minute, day = 5) {
   return new Date(2026, 0, day, hour, minute, 0, 0).getTime();
 }

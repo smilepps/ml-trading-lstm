@@ -298,7 +298,7 @@ let refreshPoll = null;
 let refreshWasRunning = false;
 let logLines = 0;
 const MAX_LOG_LINES = 1000;
-let config = {
+const DEFAULT_CONFIG = {
   windowSize: 300,
   features: 7,
   featureNames: [],
@@ -307,8 +307,26 @@ let config = {
   horizonMax: 25,
   threshold: 0.003
 };
+let config = { ...DEFAULT_CONFIG };
 const predictionsMap = new Map();
+const predictionErrorsMap = new Map();
 const intervalsMap = new Map(); // interval -> строка /api/intervals (свечи + состояние модели)
+let tickerVersion = 0;
+let intervalsRequest = 0;
+let predictRequest = 0;
+let configRequest = 0;
+let sampleRequest = 0;
+let tickersRequest = 0;
+let stateVersion = 0;
+const intervalVersions = new Map();
+
+function currentTicker(ticker, version) {
+  return activeTicker === ticker && tickerVersion === version;
+}
+
+function markIntervalChanged(interval) {
+  intervalVersions.set(interval, ++stateVersion);
+}
 
 // Сервер различает «модели нет» (нет файлов) и «модель сломана» (файлы есть,
 // но несовместимы: например скейлер ждёт контекст 15m). Раньше фронтенд видел
@@ -374,6 +392,8 @@ function statusRow(interval) {
   const info = intervalsMap.get(interval);
   if (!info) return null;
   const status = modelStatusOf(interval, null);
+  const failure = predictionErrorsMap.get(interval);
+  if (failure && status.ok) return { ...failure, modelStatus: status };
   const pending = status.ok;
   return {
     interval,
@@ -553,8 +573,11 @@ function updateTitles() {
 }
 
 async function loadTickers(preserveActive = true) {
+  const version = tickerVersion;
+  const request = ++tickersRequest;
   try {
     const data = await fetchJson('/api/tickers');
+    if (version !== tickerVersion || request !== tickersRequest) return;
     if (!Array.isArray(data)) throw new Error('некорректный ответ');
     TICKERS = data;
     const previous = preserveActive ? activeTicker : null;
@@ -573,15 +596,24 @@ async function loadTickers(preserveActive = true) {
       } else {
         updateTitles();
       }
+    } else {
+      activeTicker = null;
+      tickerVersion++;
+      resetTickerData();
+      updateTitles();
     }
   } catch (e) {
-    log('Ошибка загрузки тикеров: ' + e.message, 'error');
+    if (version === tickerVersion && request === tickersRequest) log('Ошибка загрузки тикеров: ' + e.message, 'error');
   }
 }
 
 async function loadConfig() {
+  const ticker = activeTicker;
+  const version = tickerVersion;
+  const request = ++configRequest;
   try {
-    const c = await fetchJson('/api/config?ticker=' + encodeURIComponent(activeTicker || ''));
+    const c = await fetchJson('/api/config?ticker=' + encodeURIComponent(ticker || ''));
+    if (!currentTicker(ticker, version) || request !== configRequest) return;
     config = { ...config, ...c };
     horizonInput.min = String(config.horizonMin);
     horizonInput.max = String(config.horizonMax);
@@ -613,7 +645,7 @@ async function loadConfig() {
         : '';
     }
   } catch (e) {
-    log('Ошибка загрузки конфигурации: ' + e.message, 'error');
+    if (currentTicker(ticker, version) && request === configRequest) log('Ошибка загрузки конфигурации: ' + e.message, 'error');
   }
 }
 
@@ -626,16 +658,40 @@ function currentHorizon() {
 }
 
 async function loadIntervals(preserveSelection = false) {
+  const ticker = activeTicker;
+  const version = tickerVersion;
+  const request = ++intervalsRequest;
+  const startedAt = stateVersion;
   try {
-    const prev = preserveSelection ? new Set(selectedIntervals) : null;
-    const data = await fetchJson('/api/intervals?ticker=' + encodeURIComponent(activeTicker || ''));
+    const data = await fetchJson('/api/intervals?ticker=' + encodeURIComponent(ticker || ''));
+    if (!currentTicker(ticker, version) || request !== intervalsRequest) return;
     if (!Array.isArray(data)) throw new Error(data.error || 'некорректный ответ');
+    const prev = preserveSelection ? new Set(selectedIntervals) : null;
+    const oldInfo = new Map(intervalsMap);
+    const oldPredictions = new Map(predictionsMap);
+    const oldErrors = new Map(predictionErrorsMap);
     INTERVALS = data.map(d => d.interval);
     intervalsMap.clear();
-    for (const d of data) intervalsMap.set(d.interval, d);
+    predictionsMap.clear();
+    predictionErrorsMap.clear();
+    for (const d of data) {
+      const changed = (intervalVersions.get(d.interval) || 0) > startedAt;
+      const previousInfo = oldInfo.get(d.interval);
+      intervalsMap.set(d.interval, changed && previousInfo
+        ? { ...d, hasModel: previousInfo.hasModel, modelStatus: previousInfo.modelStatus } : d);
+      if (changed) {
+        if (oldPredictions.has(d.interval)) predictionsMap.set(d.interval, oldPredictions.get(d.interval));
+        if (oldErrors.has(d.interval)) predictionErrorsMap.set(d.interval, oldErrors.get(d.interval));
+      } else {
+        if (d.prediction && !d.prediction.error && d.hasModel) predictionsMap.set(d.interval, d.prediction);
+        if (d.predictionError) predictionErrorsMap.set(d.interval, d.predictionError);
+      }
+      markIntervalChanged(d.interval);
+    }
     intervalsSel.innerHTML = '';
     sampleInterval.innerHTML = '';
-    for (const d of data) {
+    for (const row of data) {
+      const d = intervalsMap.get(row.interval);
       const reasonText = d.hasModel ? '' : modelReasonText(modelStatusOf(d.interval, null));
       const o = document.createElement('option');
       o.value = d.interval;
@@ -657,20 +713,29 @@ async function loadIntervals(preserveSelection = false) {
       Array.from(intervalsSel.options).forEach(o => { o.selected = true; });
       syncSelected();
     }
-    for (const d of data) {
-      // Прогноз из /api/intervals — это кэш монитора. Если его нет, строку
-      // всё равно показываем (statusRow), чтобы не прятать сломанную модель.
-      if (d.prediction) predictionsMap.set(d.interval, d.prediction);
-    }
     if (sampleInterval.options.length) {
       sampleInterval.value = selectedIntervals[0] || data[0].interval;
     }
     renderTable();
     updateSummary();
-    log(`Интервалы ${activeTicker}: ${INTERVALS.join(', ')} (${INTERVALS.length})`, 'debug');
+    log(`Интервалы ${ticker}: ${INTERVALS.join(', ')} (${INTERVALS.length})`, 'debug');
   } catch (e) {
-    log('Ошибка загрузки интервалов: ' + e.message, 'error');
+    if (currentTicker(ticker, version) && request === intervalsRequest) log('Ошибка загрузки интервалов: ' + e.message, 'error');
   }
+}
+
+function applyPrediction(interval, result, status) {
+  const info = intervalsMap.get(interval) || { interval };
+  const modelProblem = result?.error && result.errorReason !== 'predict_failed';
+  const nextStatus = status || (modelProblem
+    ? { ok: false, reason: result.errorReason, error: result.error }
+    : { ok: true, reason: 'ok', error: null });
+  intervalsMap.set(interval, { ...info, hasModel: nextStatus.ok, modelStatus: nextStatus });
+  predictionsMap.delete(interval);
+  predictionErrorsMap.delete(interval);
+  if (result?.error) predictionErrorsMap.set(interval, result);
+  else if (result) predictionsMap.set(interval, result);
+  markIntervalChanged(interval);
 }
 
 async function fetchPredict() {
@@ -679,33 +744,76 @@ async function fetchPredict() {
     log('Не выбрано ни одного интервала', 'warn');
     return;
   }
+  const ticker = activeTicker;
+  const version = tickerVersion;
+  const request = ++predictRequest;
+  const startedAt = stateVersion;
+  const requested = selectedIntervals.slice();
   try {
-    const url = '/api/predict?ticker=' + encodeURIComponent(activeTicker) +
-      '&intervals=' + encodeURIComponent(selectedIntervals.join(','));
+    const url = '/api/predict?ticker=' + encodeURIComponent(ticker) +
+      '&intervals=' + encodeURIComponent(requested.join(','));
     const data = await fetchJson(url);
+    if (!currentTicker(ticker, version) || request !== predictRequest) return;
     if (!Array.isArray(data)) throw new Error(data.error || 'некорректный ответ');
-    for (const p of data) predictionsMap.set(p.interval, p);
+    const byInterval = new Map(data.filter(p => p && p.ticker === ticker && requested.includes(p.interval)).map(p => [p.interval, p]));
+    for (const interval of requested) {
+      if ((intervalVersions.get(interval) || 0) > startedAt) continue;
+      const result = byInterval.get(interval) || { interval, ticker, error: 'Нет ответа для интервала', errorReason: 'predict_failed' };
+      applyPrediction(interval, result);
+    }
     renderTable();
     updateSummary();
     lastUpd.textContent = new Date().toLocaleTimeString();
     const ok = data.filter(d => !d.error).length;
-    log(`Прогноз ${activeTicker}: ${ok}/${data.length} интервалов рассчитано`);
+    log(`Прогноз ${ticker}: ${ok}/${data.length} интервалов рассчитано`);
   } catch (e) {
+    if (!currentTicker(ticker, version) || request !== predictRequest) return;
+    for (const interval of requested) {
+      if ((intervalVersions.get(interval) || 0) > startedAt) continue;
+      const info = intervalsMap.get(interval);
+      applyPrediction(interval, { interval, ticker, error: e.message, errorReason: 'predict_failed' }, info?.modelStatus);
+    }
+    renderTable();
+    updateSummary();
     log('Ошибка предсказания: ' + e.message, 'error');
   }
+}
+
+function resetTickerData() {
+  config = { ...DEFAULT_CONFIG };
+  thresholdVal.textContent = '—';
+  thresholdVal.title = '';
+  thresholdDetail.textContent = '';
+  horizonVal.textContent = '—';
+  predictionsMap.clear();
+  predictionErrorsMap.clear();
+  intervalsMap.clear();
+  intervalVersions.clear();
+  INTERVALS = [];
+  selectedIntervals = [];
+  intervalsSel.innerHTML = '';
+  sampleInterval.innerHTML = '';
+  sampleInfo.textContent = '';
+  sampleRows.innerHTML = '';
+  sampleDownload.removeAttribute('href');
+  lastUpd.textContent = '—';
+  renderTable();
+  updateSummary();
 }
 
 async function selectTicker(ticker) {
   if (!ticker) return;
   activeTicker = ticker;
+  const version = ++tickerVersion;
   tickerSel.value = ticker;
-  predictionsMap.clear();
-  intervalsMap.clear();
-  selectedIntervals = [];
+  resetTickerData();
   updateTitles();
   await loadConfig();
+  if (!currentTicker(ticker, version)) return;
   await loadIntervals(false);
+  if (!currentTicker(ticker, version)) return;
   await fetchPredict();
+  if (!currentTicker(ticker, version)) return;
   await loadSample();
 }
 
@@ -892,11 +1000,15 @@ function percentLabel(value) {
 
 async function loadSample() {
   if (!activeTicker || !sampleInterval.value) return;
+  const ticker = activeTicker;
+  const version = tickerVersion;
+  const request = ++sampleRequest;
   const interval = sampleInterval.value;
   sampleInfo.textContent = 'Загрузка…';
   sampleRows.innerHTML = '';
   try {
-    const s = await fetchJson(`/api/sample?ticker=${encodeURIComponent(activeTicker)}&interval=${encodeURIComponent(interval)}`);
+    const s = await fetchJson(`/api/sample?ticker=${encodeURIComponent(ticker)}&interval=${encodeURIComponent(interval)}`);
+    if (!currentTicker(ticker, version) || request !== sampleRequest || sampleInterval.value !== interval) return;
     const shape = Object.entries(s.shape || {}).map(([k, v]) => `${k}: ${v[0]}×${v[1]}`).join(' | ');
     sampleInfo.innerHTML = `
       <b>${esc(s.ticker)} ${esc(s.interval)}</b> · окно ${esc(s.window)} · горизонт ${esc(s.horizon)} · порог ${percentLabel(s.threshold)}${s.thresholdMultiplier != null ? ` (×${esc(s.thresholdMultiplier)})` : ''} · порядок: <code>${esc(s.order)}</code><br>
@@ -926,8 +1038,9 @@ async function loadSample() {
       wrap.append(h, table);
       sampleRows.appendChild(wrap);
     }
-    log(`Пример входа ${activeTicker} ${interval}: ${shape}`, 'debug');
+    log(`Пример входа ${ticker} ${interval}: ${shape}`, 'debug');
   } catch (e) {
+    if (!currentTicker(ticker, version) || request !== sampleRequest || sampleInterval.value !== interval) return;
     sampleInfo.textContent = e.message;
     sampleDownload.removeAttribute('href');
   }
@@ -1012,19 +1125,33 @@ intervalsSel.addEventListener('change', () => {
 // SSE поток для реального времени
 function openStream() {
   if (evtSrc) return;
-  evtSrc = new EventSource('/stream');
-  evtSrc.onmessage = (e) => {
+  const stream = new EventSource('/stream');
+  evtSrc = stream;
+  stream.onmessage = (e) => {
+    if (evtSrc !== stream) return;
     try {
       const m = JSON.parse(e.data);
-      if (m.type === 'log') {
+      if (m.type === 'hello') {
+        // При переподключении сервер не воспроизводит пропущенные события.
+        if (activeTicker) loadIntervals(true);
+      } else if (m.type === 'log') {
         appendLog(m.line);
-      } else if (m.type === 'prediction' && m.data) {
-        if (m.ticker === activeTicker) {
-          predictionsMap.set(m.interval, m.data);
-          renderTable();
-          updateSummary();
-          lastUpd.textContent = new Date().toLocaleTimeString();
-        }
+      } else if ((m.type === 'prediction' || m.type === 'prediction_error' || m.type === 'prediction_invalidated') && m.ticker === activeTicker) {
+        if (m.data && (m.data.ticker !== m.ticker || m.data.interval !== m.interval)) return;
+        applyPrediction(m.interval, m.data || null, m.modelStatus);
+        renderTable();
+        updateSummary();
+        lastUpd.textContent = new Date().toLocaleTimeString();
+      } else if (m.type === 'interval_removed' && m.ticker === activeTicker) {
+        predictionsMap.delete(m.interval);
+        predictionErrorsMap.delete(m.interval);
+        intervalsMap.delete(m.interval);
+        INTERVALS = INTERVALS.filter(i => i !== m.interval);
+        selectedIntervals = selectedIntervals.filter(i => i !== m.interval);
+        markIntervalChanged(m.interval);
+        renderTable();
+        updateSummary();
+        loadIntervals(true);
       } else if (m.type === 'train_done') {
         log(`Обучение ${m.ticker} завершено (code=${m.code})`, m.code === 0 ? 'info' : 'error');
         if (m.ticker === activeTicker) {
@@ -1044,7 +1171,12 @@ function openStream() {
       }
     } catch (err) { /* ignore */ }
   };
-  evtSrc.onerror = () => { evtSrc.close(); evtSrc = null; setTimeout(openStream, 3000); };
+  stream.onerror = () => {
+    if (evtSrc !== stream) return;
+    stream.close();
+    evtSrc = null;
+    setTimeout(openStream, 3000);
+  };
 }
 
 // Обучение в фоне — проверяем статус через API

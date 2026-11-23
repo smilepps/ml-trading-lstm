@@ -1,0 +1,24 @@
+﻿{
+  "$schema": "https://opencode.ai",
+  "provider": {
+    "local-llama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local llama.cpp",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "sk-local",
+        "timeout": 600000
+      },
+      "models": {
+        "deepseek-v4.1-flash": {
+          "name": "DeepSeek-V4.1-Flash-1017 (Local)",
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        }
+      }
+    }
+  },
+  "model": "local-llama/deepseek-v4.1-flash"
+}

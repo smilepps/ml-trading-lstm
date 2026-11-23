@@ -219,11 +219,28 @@ async function fetchPage(apiUrl, interval, from, till, start) {
 }
 
 // ── Запись ──
+// В одном statement сначала обновляем существующие ключи, а новые вставляем
+// только по отсутствию в RETURNING. Так обычная ревизия не тратит id; конфликт
+// с параллельной вставкой всё равно разрешается через ON CONFLICT DO UPDATE.
 const UPSERT_SQL = `
+  WITH incoming AS (
+    SELECT * FROM unnest(
+      $1::text[], $2::text[], $3::timestamp[], $4::float8[], $5::float8[],
+      $6::float8[], $7::float8[], $8::float8[], $9::bigint[]
+    ) AS r(ticker, interval, begin, open, close, high, low, value, volume)
+  ), updated AS (
+    UPDATE candles AS c SET
+      open = r.open, close = r.close, high = r.high, low = r.low,
+      value = r.value, volume = r.volume
+    FROM incoming AS r
+    WHERE c.ticker = r.ticker AND c.interval = r.interval AND c.begin = r.begin
+    RETURNING c.ticker, c.interval, c.begin
+  )
   INSERT INTO candles (ticker, interval, begin, open, close, high, low, value, volume)
-  SELECT * FROM unnest(
-    $1::text[], $2::text[], $3::timestamp[], $4::float8[], $5::float8[],
-    $6::float8[], $7::float8[], $8::float8[], $9::bigint[]
+  SELECT r.* FROM incoming AS r
+  WHERE NOT EXISTS (
+    SELECT 1 FROM updated AS u
+    WHERE u.ticker = r.ticker AND u.interval = r.interval AND u.begin = r.begin
   )
   ON CONFLICT (ticker, interval, begin) DO UPDATE SET
     open = EXCLUDED.open,

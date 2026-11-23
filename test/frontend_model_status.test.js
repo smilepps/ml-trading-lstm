@@ -10,6 +10,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8').replace(/\r\n/g, '\n');
 
@@ -44,6 +45,7 @@ function buildUi() {
   const factory = new Function(`
     const intervalsMap = new Map();      // результаты /api/intervals
     const predictionsMap = new Map();    // результаты /api/predict
+    const predictionErrorsMap = new Map();
     const INTERVALS = ['1m', '10m', '60m', '1D'];
     let selectedIntervals = INTERVALS.slice();
     const activeTicker = 'SBER';
@@ -169,4 +171,176 @@ test('текст причины состояния модели человеко
     'ONNX load failed'
   );
   assert.equal(ui.modelReasonText({ ok: false, reason: 'какая-то-причина', error: null }), 'какая-то-причина');
+});
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((a, b) => { resolve = a; reject = b; });
+  return { promise, resolve, reject };
+}
+
+function browser() {
+  class Element {
+    constructor() { this.children = []; this._innerHTML = ''; this.value = ''; this.textContent = ''; this.classList = { toggle() {} }; }
+    set innerHTML(v) { this._innerHTML = v; this.children = []; }
+    get innerHTML() { return this._innerHTML; }
+    get options() { return this.children; }
+    get childElementCount() { return this.children.length; }
+    get selectedOptions() { return this.children.filter(o => o.selected); }
+    appendChild(child) { this.children.push(child); if (!this.value && child.value) this.value = child.value; return child; }
+    append(...children) { children.forEach(c => this.appendChild(c)); }
+    addEventListener() {}
+    removeAttribute(name) { delete this[name]; }
+  }
+  const elements = new Map();
+  const document = {
+    getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
+    createElement() { return new Element(); },
+  };
+  const streams = [];
+  class EventSource {
+    constructor() { streams.push(this); }
+    close() { this.closed = true; }
+    send(message) { this.onmessage({ data: JSON.stringify(message) }); }
+  }
+  const timers = [];
+  const mocks = { fetchJson: async () => { throw new Error('unexpected request'); } };
+  const source = between('<script>', '// Инициализация', 'script').slice('<script>'.length);
+  const sandbox = { document, EventSource, mocks, console, URL, Blob, navigator: {},
+    setTimeout: (fn) => { timers.push(fn); }, setInterval() {}, clearInterval() {} };
+  vm.runInNewContext(source + `
+    fetchJson = (url, options) => mocks.fetchJson(url, options);
+    this.ui = {
+      loadIntervals, fetchPredict, loadConfig, loadSample, selectTicker, openStream, statusRow,
+      setTicker(t) { activeTicker = t; tickerVersion++; resetTickerData(); },
+      get ticker() { return activeTicker; }, get intervals() { return INTERVALS; },
+      get config() { return config; }, predictionsMap, predictionErrorsMap, intervalsMap,
+      sampleInfo, sampleInterval
+    };`, sandbox);
+  return { ui: sandbox.ui, mocks, streams, timers };
+}
+
+function row(interval, prediction = null, predictionError = null) {
+  return { interval, candles: 100, hasModel: true, modelStatus: { ok: true, reason: 'ok', error: null }, prediction, predictionError };
+}
+function prediction(ticker, interval, pUp = 0.7) { return { ticker, interval, pUp, lastClose: 100 }; }
+
+test('снимок интервалов удаляет null и исчезнувшие прогнозы, но сохраняет причину ошибки', async () => {
+  const { ui, mocks } = browser();
+  ui.setTicker('SBER');
+  let rows = [row('1m', prediction('SBER', '1m')), row('10m', prediction('SBER', '10m'))];
+  mocks.fetchJson = async () => rows;
+  await ui.loadIntervals();
+  assert.equal(ui.predictionsMap.size, 2);
+  rows = [row('1m', null, { ticker: 'SBER', interval: '1m', error: 'Нет свечей', errorReason: 'predict_failed' })];
+  await ui.loadIntervals(true);
+  assert.equal(ui.predictionsMap.size, 0);
+  assert.equal(ui.intervalsMap.has('10m'), false);
+  assert.equal(ui.statusRow('1m').error, 'Нет свечей');
+  assert.equal(ui.statusRow('1m').errorReason, 'predict_failed');
+});
+
+test('ответы старого тикера и старой версии того же тикера игнорируются', async () => {
+  const { ui, mocks } = browser();
+  const first = deferred();
+  ui.setTicker('SBER');
+  mocks.fetchJson = () => first.promise;
+  const pending = ui.loadIntervals();
+  ui.setTicker('GAZP');
+  mocks.fetchJson = async () => [row('10m', prediction('GAZP', '10m'))];
+  await ui.loadIntervals();
+  first.resolve([row('1m', prediction('SBER', '1m'))]);
+  await pending;
+  assert.equal(ui.predictionsMap.get('10m').ticker, 'GAZP');
+  assert.equal(ui.intervalsMap.has('1m'), false);
+  const second = deferred();
+  ui.setTicker('SBER');
+  mocks.fetchJson = () => second.promise;
+  const oldConfig = ui.loadConfig();
+  ui.setTicker('GAZP');
+  ui.setTicker('SBER');
+  mocks.fetchJson = async () => ({ threshold: 0.123 });
+  await ui.loadConfig();
+  second.resolve({ threshold: 0.999 });
+  await oldConfig;
+  assert.equal(ui.config.threshold, 0.123);
+});
+
+test('поздние predict и sample старого тикера не попадают в новый', async () => {
+  const { ui, mocks } = browser();
+  ui.setTicker('SBER');
+  mocks.fetchJson = async () => [row('1m', prediction('SBER', '1m'))];
+  await ui.loadIntervals();
+  const predictionReply = deferred();
+  const sampleReply = deferred();
+  mocks.fetchJson = url => url.startsWith('/api/predict') ? predictionReply.promise : sampleReply.promise;
+  const pendingPrediction = ui.fetchPredict();
+  const pendingSample = ui.loadSample();
+  ui.setTicker('GAZP');
+  mocks.fetchJson = async () => [row('10m', prediction('GAZP', '10m'))];
+  await ui.loadIntervals();
+  predictionReply.resolve([prediction('SBER', '1m', 0.99)]);
+  sampleReply.reject(new Error('ошибка старого тикера'));
+  await Promise.all([pendingPrediction, pendingSample]);
+  assert.equal(ui.predictionsMap.size, 1);
+  assert.equal(ui.predictionsMap.get('10m').ticker, 'GAZP');
+  assert.notEqual(ui.sampleInfo.textContent, 'ошибка старого тикера');
+});
+
+test('ошибки fetchPredict не сохраняются как прогноз и не перекрывают новые события SSE', async () => {
+  const { ui, mocks, streams } = browser();
+  ui.setTicker('SBER');
+  mocks.fetchJson = async () => [row('1m', prediction('SBER', '1m'))];
+  await ui.loadIntervals();
+  ui.openStream();
+  const stream = streams[0];
+  mocks.fetchJson = async () => [{ ticker: 'SBER', interval: '1m', error: 'ONNX error', errorReason: 'predict_failed' }];
+  await ui.fetchPredict();
+  assert.equal(ui.predictionsMap.has('1m'), false);
+  assert.equal(ui.statusRow('1m').error, 'ONNX error');
+  const waiting = deferred();
+  mocks.fetchJson = () => waiting.promise;
+  const pending = ui.fetchPredict();
+  stream.send({ type: 'prediction', ticker: 'SBER', interval: '1m', data: prediction('SBER', '1m', 0.9) });
+  waiting.resolve([{ ticker: 'SBER', interval: '1m', error: 'старый сбой', errorReason: 'predict_failed' }]);
+  await pending;
+  assert.equal(ui.predictionsMap.get('1m').pUp, 0.9);
+  assert.equal(ui.predictionErrorsMap.size, 0);
+  stream.send({ type: 'prediction_error', ticker: 'SBER', interval: '1m',
+    modelStatus: { ok: false, reason: 'missing_scaler', error: 'Нет скейлера' },
+    data: { ticker: 'SBER', interval: '1m', error: 'Нет скейлера', errorReason: 'missing_scaler' } });
+  assert.equal(ui.predictionsMap.size, 0);
+  assert.equal(ui.statusRow('1m').error, 'Нет скейлера');
+  stream.send({ type: 'prediction', ticker: 'SBER', interval: '1m', data: prediction('SBER', '1m', 0.8) });
+  assert.equal(ui.predictionsMap.get('1m').pUp, 0.8);
+  assert.equal(ui.intervalsMap.get('1m').modelStatus.reason, 'ok');
+});
+
+test('события SSE новее снимка, переподключение пересинхронизирует и отбрасывает старый поток', async () => {
+  const { ui, mocks, streams, timers } = browser();
+  ui.setTicker('SBER');
+  mocks.fetchJson = async () => [row('1m', prediction('SBER', '1m'))];
+  await ui.loadIntervals();
+  ui.openStream();
+  const first = streams[0];
+  const waiting = deferred();
+  mocks.fetchJson = () => waiting.promise;
+  const pending = ui.loadIntervals(true);
+  first.send({ type: 'prediction_invalidated', ticker: 'SBER', interval: '1m',
+    modelStatus: { ok: false, reason: 'missing_model', error: 'Модель удалена' } });
+  waiting.resolve([row('1m', prediction('SBER', '1m'))]);
+  await pending;
+  assert.equal(ui.predictionsMap.size, 0);
+  assert.equal(ui.statusRow('1m').error, 'Модель удалена');
+  first.onerror();
+  timers.shift()();
+  const second = streams[1];
+  first.send({ type: 'prediction', ticker: 'SBER', interval: '1m', data: prediction('SBER', '1m') });
+  assert.equal(ui.predictionsMap.size, 0);
+  const reconnect = deferred();
+  mocks.fetchJson = () => reconnect.promise;
+  second.send({ type: 'hello' });
+  reconnect.resolve([row('1m', null, { ticker: 'SBER', interval: '1m', error: 'Нет свечей', errorReason: 'predict_failed' })]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ui.statusRow('1m').error, 'Нет свечей');
 });

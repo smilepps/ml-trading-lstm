@@ -20,6 +20,58 @@ const MODEL_DIR = path.join(__dirname, 'models');
 const WINDOW_SIZE = 300;
 const BASE_FEATURE_NAMES = ['ret_z', 'high_dev', 'low_dev', 'close_dev', 'value_z', 'dow_z', 'hour_z'];
 const OI_FEATURE_NAMES = ['yur_net_z', 'fiz_net_z'];
+// Должно совпадать с CONTEXT_MAP в train_gpu.py; порядок задаёт входы ONNX.
+const CONTEXT_MAP = Object.freeze({
+  '1m': Object.freeze(['10m', '60m']),
+  '10m': Object.freeze(['60m', '1D']),
+  '60m': Object.freeze(['1D']),
+  '1D': Object.freeze([]),
+});
+
+function validateScaler(scaler, ticker, interval, label = 'Скейлер') {
+  const fail = (detail) => { throw new Error(`${label}: ${detail}`); };
+  if (!thresholds.isSupportedInterval(interval)) fail(`интервал ${interval} не поддерживается`);
+  if (!scaler || typeof scaler !== 'object' || Array.isArray(scaler)) fail('некорректный JSON');
+  if (scaler.version !== 4) fail(`версия ${scaler.version}, ожидается version=4`);
+  if (scaler.ticker !== ticker) fail(`тикер ${scaler.ticker}, ожидается ${ticker}`);
+  if (scaler.interval !== interval) fail(`интервал ${scaler.interval}, ожидается ${interval}`);
+  if (!Number.isInteger(scaler.window) || scaler.window <= 0) fail('нет корректного window');
+  if (scaler.order !== 'current_to_history') fail(`порядок ${scaler.order}, ожидается current_to_history`);
+  const expected = CONTEXT_MAP[interval];
+  if (!Array.isArray(scaler.contexts) || scaler.contexts.some((ctx) => !thresholds.isSupportedInterval(ctx))) {
+    fail(`неподдерживаемые или некорректные контексты ${JSON.stringify(scaler.contexts)}, ожидаются ${JSON.stringify(expected)}`);
+  }
+  if (JSON.stringify(scaler.contexts) !== JSON.stringify(expected)) {
+    fail(`контексты ${JSON.stringify(scaler.contexts)}, ожидаются ${JSON.stringify(expected)}`);
+  }
+  if (scaler.inputs !== 1 + expected.length) fail(`inputs=${scaler.inputs}, ожидается ${1 + expected.length}`);
+  const featureNames = scaler.feature_names;
+  const base = BASE_FEATURE_NAMES;
+  const withOi = [...base, ...OI_FEATURE_NAMES];
+  if (!Array.isArray(featureNames) ||
+      (JSON.stringify(featureNames) !== JSON.stringify(base) && JSON.stringify(featureNames) !== JSON.stringify(withOi))) {
+    fail(`несовместимые feature_names: ${JSON.stringify(featureNames)}`);
+  }
+  if (scaler.input_size !== featureNames.length) fail(`input_size=${scaler.input_size}, ожидается ${featureNames.length}`);
+  const stats = ['ret_mean', 'ret_std', 'value_mean', 'value_std', 'dow_mean', 'dow_std', 'hour_mean', 'hour_std'];
+  if (featureNames.length === withOi.length) stats.push('yur_net_mean', 'yur_net_std', 'fiz_net_mean', 'fiz_net_std');
+  for (const key of stats) {
+    if (typeof scaler[key] !== 'number' || !Number.isFinite(scaler[key])) fail(`нет числового поля ${key}`);
+    if (key.endsWith('_std') && scaler[key] <= 0) fail(`${key} должен быть положительным`);
+  }
+  return scaler;
+}
+
+function validateContextScaler(scaler, baseScaler, ticker, interval, label) {
+  validateScaler(scaler, ticker, interval, label);
+  if (scaler.window !== baseScaler.window) {
+    throw new Error(`${label}: окно ${scaler.window}, а у base-модели ${baseScaler.window}`);
+  }
+  if (JSON.stringify(scaler.feature_names) !== JSON.stringify(baseScaler.feature_names)) {
+    throw new Error(`${label}: feature_names не совпадают с base-моделью`);
+  }
+}
+
 // Для прогноза достаточно windowSize нормализованных строк + 1 свеча для prev_close.
 // Берём с запасом: контекстам может понадобиться больше одной свечи на выравнивание.
 const HISTORY_LIMIT = 600;
@@ -43,7 +95,7 @@ function fileExists(file) {
 function modelFingerprint(paths) {
   return paths.map((file) => {
     const st = fs.statSync(file);
-    return { file, mtimeMs: st.mtimeMs, size: st.size };
+    return { file, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size, ino: st.ino };
   });
 }
 
@@ -64,78 +116,34 @@ async function loadModel(ticker, interval) {
     throw new Error(`Скейлер не найден: ${scalerPath}`);
   }
 
-  const scaler = readJson(scalerPath);
-  if (scaler.version !== 4) {
-    throw new Error(
-      `Скейлер ${scalerPath} версии ${scaler.version}, а inference_v4.js поддерживает только version=4`
-    );
-  }
-  if (scaler.ticker && String(scaler.ticker).toUpperCase() !== String(ticker).toUpperCase()) {
-    throw new Error(`Скейлер ${scalerPath} относится к тикеру ${scaler.ticker}, а не ${ticker}`);
-  }
-  if (scaler.interval && String(scaler.interval) !== String(interval)) {
-    throw new Error(`Скейлер ${scalerPath} относится к интервалу ${scaler.interval}, а не ${interval}`);
-  }
-  const featureNames = Array.isArray(scaler.feature_names) && scaler.feature_names.length
-    ? scaler.feature_names
-    : BASE_FEATURE_NAMES;
-  const inputSize = Number(scaler.input_size) || featureNames.length;
-  if (inputSize !== featureNames.length) {
-    throw new Error(
-      `Скейлер ${scalerPath}: input_size=${scaler.input_size} не совпадает с числом feature_names (${featureNames.length})`
-    );
-  }
-  const usesOi = OI_FEATURE_NAMES.every((name) => featureNames.includes(name));
-
-  const window = Number.isInteger(Number(scaler.window)) && Number(scaler.window) > 0
-    ? Number(scaler.window)
-    : WINDOW_SIZE;
+  // Сначала фиксируем base-файлы: скейлер нельзя читать одновременно с заменой.
+  const baseFiles = modelFingerprint([modelPath, scalerPath]);
+  const scaler = validateScaler(readJson(scalerPath), ticker, interval, `Скейлер ${scalerPath}`);
+  const featureNames = scaler.feature_names;
+  const inputSize = scaler.input_size;
+  const usesOi = featureNames.length === BASE_FEATURE_NAMES.length + OI_FEATURE_NAMES.length;
+  const window = scaler.window;
   const horizon = Number(scaler.horizon) || 10;
-
-  const contexts = Array.isArray(scaler.contexts) ? scaler.contexts : [];
+  const contexts = scaler.contexts;
   const contextScalerPaths = contexts.map((ctx) => path.join(MODEL_DIR, `scaler_${ticker}_${ctx}.json`));
+  for (const ctxPath of contextScalerPaths) {
+    if (!fileExists(ctxPath)) throw new Error(`Скейлер контекста не найден: ${ctxPath}`);
+  }
+  const files = [...baseFiles, ...modelFingerprint(contextScalerPaths)];
   const contextScalers = contexts.map((ctx, index) => {
     const ctxPath = contextScalerPaths[index];
-    if (!fileExists(ctxPath)) {
-      throw new Error(`Скейлер контекста не найден: ${ctxPath}`);
-    }
     const ctxScaler = readJson(ctxPath);
-    if (ctxScaler.version !== 4) {
-      throw new Error(
-        `Скейлер контекста ${ctxPath} версии ${ctxScaler.version}, ожидается version=4`
-      );
-    }
-    if (ctxScaler.ticker && String(ctxScaler.ticker).toUpperCase() !== String(ticker).toUpperCase()) {
-      throw new Error(`Скейлер контекста ${ctxPath} относится к тикеру ${ctxScaler.ticker}`);
-    }
-    if (ctxScaler.interval && String(ctxScaler.interval) !== String(ctx)) {
-      throw new Error(`Скейлер контекста ${ctxPath} относится к интервалу ${ctxScaler.interval}, а не ${ctx}`);
-    }
-    const ctxWindow = Number(ctxScaler.window);
-    if (Number.isInteger(ctxWindow) && ctxWindow > 0 && ctxWindow !== window) {
-      throw new Error(
-        `Скейлер контекста ${ctxPath}: окно ${ctxWindow}, а у base-модели ${window}`
-      );
-    }
-    const ctxInputSize = Number(ctxScaler.input_size) ||
-      (Array.isArray(ctxScaler.feature_names) ? ctxScaler.feature_names.length : BASE_FEATURE_NAMES.length);
-    if (ctxInputSize !== inputSize) {
-      throw new Error(
-        `Скейлер контекста ${ctxPath}: input_size=${ctxInputSize}, а у base-модели ${inputSize}`
-      );
-    }
+    validateContextScaler(ctxScaler, scaler, ticker, ctx, `Скейлер контекста ${ctxPath}`);
     return ctxScaler;
   });
 
   const session = await ort.InferenceSession.create(modelPath);
-  const expectedInputs = 1 + contexts.length;
-  if (session.inputNames.length !== expectedInputs) {
-    throw new Error(
-      `У модели ${modelPath} ${session.inputNames.length} входов, а контекстов ${contexts.length} (ожидалось ${expectedInputs})`
-    );
+  const expectedNames = ['input_base', 'input_h1', 'input_h2'].slice(0, 1 + contexts.length);
+  if (session.inputNames.length !== expectedNames.length ||
+      expectedNames.some((name) => !session.inputNames.includes(name))) {
+    throw new Error(`У модели ${modelPath} входы ${session.inputNames.join(', ')}, ожидаются ${expectedNames.join(', ')}`);
   }
-
-  const files = modelFingerprint([modelPath, scalerPath, ...contextScalerPaths]);
+  if (!isModelFresh({ files })) throw new Error(`Файлы модели ${modelPath} изменились во время загрузки`);
   return {
     ticker,
     interval,
@@ -163,7 +171,8 @@ function isModelFresh(model) {
   try {
     for (const item of model.files) {
       const st = fs.statSync(item.file);
-      if (st.mtimeMs !== item.mtimeMs || st.size !== item.size) return false;
+      if (st.mtimeMs !== item.mtimeMs || st.ctimeMs !== item.ctimeMs ||
+          st.size !== item.size || st.ino !== item.ino) return false;
     }
     return true;
   } catch (e) {
@@ -309,8 +318,9 @@ function normalizeCandles(candles, scaler) {
   const dowStd = Math.abs(scalerStat(scaler, 'dow_std')) || 1;
   const hourMean = scalerStat(scaler, 'hour_mean');
   const hourStd = Math.abs(scalerStat(scaler, 'hour_std')) || 1;
-  const withOi = Number.isFinite(Number(scaler.yur_net_mean)) &&
-    Number.isFinite(Number(scaler.fiz_net_mean));
+  const withOi = Array.isArray(scaler.feature_names)
+    ? OI_FEATURE_NAMES.every((name) => scaler.feature_names.includes(name))
+    : Number.isFinite(Number(scaler.yur_net_mean)) && Number.isFinite(Number(scaler.fiz_net_mean));
   let yurMean = 0;
   let yurStd = 1;
   let fizMean = 0;
@@ -428,7 +438,7 @@ async function predictWithModel(client, model, ticker, interval, options = {}) {
 
   // OI нужен, если его ждут base-скейлер или любой контекст.
   const needsOi = model.usesOi || contextScalers.some(
-    (s) => Number.isFinite(Number(s.yur_net_mean)) && Number.isFinite(Number(s.fiz_net_mean))
+    (s) => Array.isArray(s.feature_names) && OI_FEATURE_NAMES.every((name) => s.feature_names.includes(name))
   );
   const oi = needsOi ? await loadOiSeries(client, ticker) : null;
   if (needsOi) attachOi(baseCandles, interval, oi);
@@ -525,12 +535,22 @@ async function predictWithModel(client, model, ticker, interval, options = {}) {
 async function predictInterval(client, ticker, interval, cache = new Map(), options = {}) {
   const key = `${ticker}:${interval}`;
   let model = cache.get(key);
-  if (model && !isModelFresh(model)) model = null;
+  if (model && !isModelFresh(model)) {
+    cache.delete(key);
+    model = null;
+  }
   if (!model) {
     model = await loadModel(ticker, interval);
     cache.set(key, model);
   }
-  return predictWithModel(client, model, ticker, interval, options);
+  try {
+    const result = await predictWithModel(client, model, ticker, interval, options);
+    if (!isModelFresh(model)) throw new Error('Файлы модели изменились во время расчёта прогноза');
+    return result;
+  } catch (e) {
+    if (!isModelFresh(model) && cache.get(key) === model) cache.delete(key);
+    throw e;
+  }
 }
 
 module.exports = {
@@ -540,6 +560,9 @@ module.exports = {
   INTERVAL_MINUTES,
   BASE_FEATURE_NAMES,
   OI_FEATURE_NAMES,
+  CONTEXT_MAP,
+  validateScaler,
+  validateContextScaler,
   intervalMinutes,
   historyLimitFor,
   loadModel,

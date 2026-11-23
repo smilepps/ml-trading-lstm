@@ -1,14 +1,24 @@
-node_modules/
-.git/
-.env
-__pycache__/
-*.py[cod]
-*.log
-models/
-models_test/
-archive/
-*.png
-*.jpg
-*.jpeg
-.venv/
-venv/
+# Deny by default: secrets, local data, models and backups never enter the context.
+**
+
+# Only files needed by the application image.
+!package.json
+!package-lock.json
+!requirements.txt
+!server.js
+!db_schema.js
+!tickers.js
+!refresh_data.js
+!inference_v4.js
+!thresholds.js
+!thresholds.json
+!predict.js
+!run_python.js
+!confidence_report_v4.py
+!public/
+public/**
+!public/index.html
+
+# train_gpu.py contains a legacy credential; Compose mounts it read-only instead.
+# Environment files (including .env variants), model directories (including
+# models_backup_pre_oi) and all other local files remain excluded.

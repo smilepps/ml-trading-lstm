@@ -6,12 +6,15 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file:
-      - .env
+      - .env.docker
     environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
       PYTHON: /opt/venv/bin/python
     ports:
-      - "${PORT:-3000}:3000"
+      - "127.0.0.1:${DOCKER_PORT:-3000}:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./models:/app/models
+      - ./train_gpu.py:/app/train_gpu.py:ro

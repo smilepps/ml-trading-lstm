@@ -77,6 +77,9 @@ const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const logs = [];
 const models = new Map();      // "TICKER|interval" → модель
 const predictions = new Map(); // "TICKER|interval" → прогноз
+const predictionSignatures = new Map(); // версия файлов, для которой рассчитан прогноз
+const predictionErrors = new Map(); // ошибки отдельно от успешных прогнозов
+const predictionRuns = new Map(); // последняя попытка для каждой пары
 let sseClients = [];
 let sseHeartbeat = null;
 const SSE_HEARTBEAT_MS = 25000;
@@ -174,8 +177,8 @@ function modelFiles(ticker, interval) {
   const files = [p.model, p.scaler];
   try {
     const scaler = JSON.parse(fs.readFileSync(p.scaler, 'utf8'));
-    for (const ctx of Array.isArray(scaler.contexts) ? scaler.contexts : []) {
-      files.push(ctxScalerPath(ticker, ctx));
+    for (const ctx of Array.isArray(scaler?.contexts) ? scaler.contexts : []) {
+      if (thresholds.isSupportedInterval(ctx)) files.push(ctxScalerPath(ticker, ctx));
     }
   } catch (e) {
     /* скейлер не читается — об этом скажет modelStatus */
@@ -190,7 +193,7 @@ function modelSignature(ticker, interval) {
     .map((file) => {
       try {
         const st = fs.statSync(file);
-        return `${st.mtimeMs}|${st.size}`;
+        return `${path.basename(file)}|${st.mtimeMs}|${st.ctimeMs}|${st.size}|${st.ino}`;
       } catch (e) {
         return 'missing';
       }
@@ -209,33 +212,38 @@ function modelStatus(ticker, interval) {
   const p = modelPaths(ticker, interval);
   const fail = (reason, error) => ({ ok: false, reason, error, contexts: [] });
 
+  if (!thresholds.isSupportedInterval(interval)) {
+    return fail('unsupported_interval', `Интервал ${interval} не поддерживается: ${INTERVAL_ORDER.join(', ')}`);
+  }
+  const hasModelFile = fs.existsSync(p.model);
   if (!fs.existsSync(p.scaler)) {
-    return fail('missing_scaler', `Скейлер не найден: ${path.basename(p.scaler)}`);
+    return hasModelFile
+      ? fail('missing_scaler', `Скейлер не найден: ${path.basename(p.scaler)}`)
+      : fail('missing_model', `Модель не обучена: ${path.basename(p.model)}`);
   }
   let scaler;
   try {
     scaler = JSON.parse(fs.readFileSync(p.scaler, 'utf8'));
+    inf.validateScaler(scaler, ticker, interval, `Скейлер ${path.basename(p.scaler)}`);
   } catch (e) {
-    return fail('broken_scaler', `Скейлер ${path.basename(p.scaler)} не читается: ${e.message}`);
-  }
-  if (!Number.isInteger(scaler.window) || scaler.window <= 0) {
-    return fail('broken_scaler', `Скейлер ${path.basename(p.scaler)}: нет корректного window`);
+    return fail('broken_scaler', `Скейлер ${path.basename(p.scaler)}: ${e.message}`);
   }
 
-  const contexts = Array.isArray(scaler.contexts) ? scaler.contexts : [];
+  const contexts = scaler.contexts;
   for (const ctx of contexts) {
-    if (!thresholds.isKnownInterval(ctx)) {
-      return fail(
-        'broken_scaler',
-        `Скейлер ${path.basename(p.scaler)} ждёт контекст ${ctx}, которого нет в ${INTERVAL_ORDER.join('/')}: нужен перенатренинг`
-      );
+    const ctxPath = ctxScalerPath(ticker, ctx);
+    if (!fs.existsSync(ctxPath)) {
+      return fail('missing_context_scaler', `Скейлер контекста не найден: ${path.basename(ctxPath)}`);
     }
-    if (!fs.existsSync(ctxScalerPath(ticker, ctx))) {
-      return fail('missing_context_scaler', `Скейлер контекста не найден: ${path.basename(ctxScalerPath(ticker, ctx))}`);
+    try {
+      const ctxScaler = JSON.parse(fs.readFileSync(ctxPath, 'utf8'));
+      inf.validateContextScaler(ctxScaler, scaler, ticker, ctx, `Скейлер контекста ${path.basename(ctxPath)}`);
+    } catch (e) {
+      return fail('broken_scaler', `Скейлер контекста ${path.basename(ctxPath)}: ${e.message}`);
     }
   }
 
-  if (!fs.existsSync(p.model)) {
+  if (!hasModelFile) {
     return fail('missing_model', `Модель не обучена: ${path.basename(p.model)}`);
   }
 
@@ -287,7 +295,6 @@ function clearTickerModelIssues(ticker) {
 async function getModel(ticker, interval) {
   const key = logKey(ticker, interval);
   const cached = models.get(key);
-  if (cached && inf.isModelFresh(cached)) return cached;
   const status = modelStatus(ticker, interval);
   if (!status.ok) {
     models.delete(key);
@@ -295,9 +302,15 @@ async function getModel(ticker, interval) {
     e.modelStatus = status;
     throw e;
   }
+  if (cached && inf.isModelFresh(cached)) return cached;
+  models.delete(key);
+  const signature = modelSignature(ticker, interval);
   let model;
   try {
     model = await inf.loadModel(ticker, interval);
+    if (signature !== modelSignature(ticker, interval) || !inf.isModelFresh(model)) {
+      throw new Error('Файлы модели изменились во время загрузки');
+    }
   } catch (e) {
     // Файлы есть, но ONNX/скейлер несовместимы: это «сломанная модель»,
     // а не «модели нет».
@@ -395,6 +408,35 @@ function invalidateIntervalCache(ticker) {
 }
 
 // ── Интервалы и прогнозы ──
+function reconcilePrediction(ticker, interval, status) {
+  const key = logKey(ticker, interval);
+  const signature = modelSignature(ticker, interval);
+  const savedError = predictionErrors.get(key);
+  if (savedError && savedError.signature !== signature) predictionErrors.delete(key);
+  if (predictions.has(key) && (!status.ok || predictionSignatures.get(key) !== signature)) {
+    predictions.delete(key);
+    predictionSignatures.delete(key);
+    models.delete(key);
+    predictionRuns.set(key, (predictionRuns.get(key) || 0) + 1);
+    broadcast({ type: 'prediction_invalidated', ticker, interval, modelStatus: status });
+  }
+  return signature;
+}
+
+function clearTickerPredictions(ticker) {
+  const keys = new Set([...INTERVAL_ORDER.map((i) => logKey(ticker, i)),
+    ...predictions.keys(), ...predictionErrors.keys(), ...predictionRuns.keys()]);
+  for (const key of keys) {
+    if (!key.startsWith(`${ticker}|`)) continue;
+    const interval = key.slice(ticker.length + 1);
+    const hadPrediction = predictions.delete(key);
+    predictionSignatures.delete(key);
+    predictionErrors.delete(key);
+    predictionRuns.set(key, (predictionRuns.get(key) || 0) + 1);
+    if (hadPrediction) broadcast({ type: 'prediction_invalidated', ticker, interval, modelStatus: modelStatus(ticker, interval) });
+  }
+}
+
 async function listIntervals(client, ticker) {
   let rows;
   const cached = intervalCache.get(ticker);
@@ -412,10 +454,24 @@ async function listIntervals(client, ticker) {
     intervalCache.set(ticker, { ts: Date.now(), rows });
   }
 
+  const available = new Set(rows.map((row) => row.interval));
+  for (const key of new Set([...predictions.keys(), ...predictionErrors.keys()])) {
+    if (!key.startsWith(`${ticker}|`)) continue;
+    const interval = key.slice(ticker.length + 1);
+    if (!thresholds.isSupportedInterval(interval) || available.has(interval)) continue;
+    predictions.delete(key);
+    predictionSignatures.delete(key);
+    predictionErrors.delete(key);
+    predictionRuns.set(key, (predictionRuns.get(key) || 0) + 1);
+    broadcast({ type: 'interval_removed', ticker, interval });
+  }
+
   return [...rows]
     .sort((a, b) => intervalRank(a.interval) - intervalRank(b.interval))
     .map((row) => {
       const status = modelStatus(ticker, row.interval);
+      reconcilePrediction(ticker, row.interval, status);
+      const key = logKey(ticker, row.interval);
       return {
         interval: row.interval,
         candles: Number(row.cnt),
@@ -425,19 +481,31 @@ async function listIntervals(client, ticker) {
         // hasModel — просто «можно ли предсказывать»; modelStatus объясняет,
         // почему нельзя: нет файлов или файлы есть, но они несовместимы.
         modelStatus: { ok: status.ok, reason: status.reason, error: status.error },
-        prediction: predictions.get(logKey(ticker, row.interval)) || null,
+        prediction: predictions.get(key) || null,
+        predictionError: predictionErrors.get(key)?.result || null,
       };
     });
 }
 
 async function predictOne(client, ticker, interval) {
   const requested = String(interval || '').trim();
+  const key = logKey(ticker, requested);
+  if (thresholds.isSupportedInterval(requested)) {
+    reconcilePrediction(ticker, requested, modelStatus(ticker, requested));
+  }
+  const run = (predictionRuns.get(key) || 0) + 1;
+  predictionRuns.set(key, run);
+  const signature = thresholds.isSupportedInterval(requested) ? modelSignature(ticker, requested) : null;
   try {
     thresholds.validateInterval(requested);
     const model = await getModel(ticker, requested);
     const r = await inf.predictWithModel(client, model, ticker, requested, {
       fallbackBaseThreshold: THRESHOLD_BASE,
     });
+    if (signature !== modelSignature(ticker, requested) || !inf.isModelFresh(model)) {
+      throw new Error('Файлы модели изменились во время расчёта прогноза');
+    }
+    if (predictionRuns.get(key) !== run) throw new Error('Расчёт прогноза заменён более новой попыткой');
 
     // inference_v4 уже разрешил порог по scaler: не пересчитываем его здесь,
     // иначе .env мог бы изменить цель обученной модели.
@@ -464,15 +532,19 @@ async function predictOne(client, ticker, interval) {
       features: Array.isArray(r.inputShape) ? r.inputShape[2] : FEATURES,
       updatedAt: new Date().toISOString(),
     };
-    predictions.set(logKey(ticker, requested), result);
+    predictions.set(key, result);
+    predictionSignatures.set(key, signature);
+    predictionErrors.delete(key);
+    broadcast({ type: 'prediction', ticker, interval: requested, data: result });
     return result;
   } catch (e) {
-    // Ошибку в кэш прогнозов не кладём. Раньше строка {error} оставалась в
-    // predictions и возвращалась из /api/intervals как «прогноз», поэтому
-    // временный сбой вытеснял валидный прогноз и путался с настоящим
-    // состоянием модели.
-    const key = logKey(ticker, requested);
-    predictions.delete(key);
+    const currentRun = predictionRuns.get(key) === run;
+    const currentSignature = thresholds.isSupportedInterval(requested) ? modelSignature(ticker, requested) : null;
+    if (currentRun) {
+      predictions.delete(key);
+      predictionSignatures.delete(key);
+      if (signature !== currentSignature) models.delete(key);
+    }
 
     // Даже для неизвестного интервала отвечаем строкой ошибки, а не 500.
     // Если модель существует, показываем её реальный порог из скейлера.
@@ -483,6 +555,13 @@ async function predictOne(client, ticker, interval) {
     let issue;
     if (!known) {
       issue = { reason: 'unsupported_interval', error: e.message };
+    } else if (!currentRun) {
+      issue = { reason: 'predict_failed', error: 'Расчёт прогноза заменён более новой попыткой' };
+    } else if (signature !== currentSignature) {
+      const status = modelStatus(ticker, requested);
+      issue = status.ok
+        ? { reason: 'predict_failed', error: 'Файлы модели изменились во время расчёта прогноза' }
+        : { reason: status.reason, error: status.error };
     } else if (e.modelStatus) {
       issue = { reason: e.modelStatus.reason, error: e.modelStatus.error };
     } else {
@@ -503,6 +582,13 @@ async function predictOne(client, ticker, interval) {
       features: FEATURES,
       updatedAt: new Date().toISOString(),
     };
+    if (currentRun) {
+      predictionErrors.set(key, { result, signature: currentSignature });
+      broadcast({
+        type: 'prediction_error', ticker, interval: requested, data: result,
+        modelStatus: known ? modelStatus(ticker, requested) : { ok: false, ...issue, contexts: [] },
+      });
+    }
     return result;
   }
 }
@@ -805,9 +891,7 @@ app.delete('/api/tickers/:ticker', wrap(async (req, res) => {
   for (const [key] of models) {
     if (key.startsWith(`${ticker}|`)) models.delete(key);
   }
-  for (const [key] of predictions) {
-    if (key.startsWith(`${ticker}|`)) predictions.delete(key);
-  }
+  clearTickerPredictions(ticker);
   clearTickerModelIssues(ticker);
   try {
     for (const name of fs.readdirSync(MODEL_DIR)) {
@@ -1049,9 +1133,7 @@ app.post('/api/train', wrap(async (req, res) => {
     // Новая модель — старые записи «модель сломана» больше не действуют.
     clearTickerModelIssues(ticker);
     // Чистим прогнозы только обученного тикера, остальные не трогаем.
-    for (const key of [...predictions.keys()]) {
-      if (key.startsWith(`${ticker}|`)) predictions.delete(key);
-    }
+    clearTickerPredictions(ticker);
     invalidateIntervalCache(ticker);
 
     if (error) pushLog('error', `Обучение ${ticker}: ${error}`);
@@ -1161,23 +1243,12 @@ async function monitorTick() {
       }
       const intervals = await listIntervals(monitorClient, item.ticker);
       for (const info of intervals) {
-        if (!info.hasModel) {
-          warnModelIssue(item.ticker, info.interval, info.modelStatus);
-          continue;
-        }
         const prediction = await predictOne(monitorClient, item.ticker, info.interval);
         if (prediction.error) {
           warnModelIssue(item.ticker, info.interval, {
             ok: false,
             reason: prediction.errorReason || 'predict_failed',
             error: prediction.error,
-          });
-        } else {
-          broadcast({
-            type: 'prediction',
-            ticker: item.ticker,
-            interval: info.interval,
-            data: prediction,
           });
         }
       }
