@@ -1,0 +1,14 @@
+node_modules/
+.git/
+.env
+__pycache__/
+*.py[cod]
+*.log
+models/
+models_test/
+archive/
+*.png
+*.jpg
+*.jpeg
+.venv/
+venv/

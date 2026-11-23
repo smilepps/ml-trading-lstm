@@ -12,6 +12,7 @@
 
 require('dotenv').config();
 const { Client } = require('pg');
+const { ensureTickersTable, ensureCandlesTable, ensureOpenInterestTable } = require('./db_schema');
 
 const ISS_TIMEOUT_MS = 15000;
 const TICKER_RE = /^[A-Za-z0-9._-]{1,32}$/;
@@ -19,6 +20,24 @@ const TICKER_RE = /^[A-Za-z0-9._-]{1,32}$/;
 const SEED = [
   { ticker: 'IMOEX', engine: 'stock', market: 'index', title: 'Индекс МосБиржи', sortOrder: 0 }
 ];
+
+// Соответствие тикера коду базового актива futoi (открытые позиции FIZ/YUR).
+// Индексы/акции сами по себе позиций не имеют — берём фьючерс на них.
+// История futoi на MOEX ISS начинается с 2023-11-16.
+const FUTOI_SECID = {
+  IMOEX: 'IMOEXF',
+  SBER: 'SBRF',
+};
+
+const FUTOI_MIN_DATE = '2023-11-16';
+
+function futoiSecid(ticker) {
+  return FUTOI_SECID[normalizeTicker(ticker)] || null;
+}
+
+function futoiUrl(secid) {
+  return `https://iss.moex.com/iss/analyticalproducts/futoi/securities/${encodeURIComponent(secid)}.json`;
+}
 
 function log(msg) {
   console.log(`[${new Date().toISOString().replace('T', ' ').substring(0, 19)}] ${msg}`);
@@ -42,16 +61,11 @@ function candlesUrl(engine, market, ticker) {
 }
 
 async function ensureSchema(client) {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS tickers (
-      ticker     varchar(32) PRIMARY KEY,
-      engine     varchar(32) NOT NULL,
-      market     varchar(32) NOT NULL,
-      title      text,
-      sort_order integer NOT NULL DEFAULT 100,
-      created_at timestamp without time zone NOT NULL DEFAULT now()
-    )
-  `);
+  await ensureTickersTable(client);
+  // Таблица свечей раньше здесь не создавалась вовсе: на чистой базе
+  // сервер поднимался, а первая же загрузка/прогноз падали на candles.
+  await ensureCandlesTable(client);
+  await ensureOpenInterestTable(client);
   for (const item of SEED) {
     await client.query(
       `INSERT INTO tickers (ticker, engine, market, title, sort_order)
@@ -96,21 +110,39 @@ async function getTicker(client, ticker) {
   };
 }
 
+async function fetchJsonWithRetry(url, opts = {}, retries = 3, baseDelayMs = 1000) {
+  let lastErr;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ISS_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, {
+        headers: { 'User-Agent': 'ml-dashboard/2.0' },
+        signal: controller.signal,
+        ...opts,
+      });
+      if (!response.ok) throw new Error(`MOEX ISS ответил HTTP ${response.status}`);
+      return await response.json();
+    } catch (e) {
+      lastErr = e;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (attempt < retries - 1) {
+      await new Promise(resolve => setTimeout(resolve, baseDelayMs * (attempt + 1)));
+    }
+  }
+  throw lastErr || new Error(`Не удалось получить данные с MOEX ISS после ${retries} попыток`);
+}
+
 async function resolveTicker(ticker) {
   const t = validateTicker(ticker);
   const url = `https://iss.moex.com/iss/securities/${encodeURIComponent(t)}.json?iss.meta=off`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ISS_TIMEOUT_MS);
   let payload;
   try {
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'ml-dashboard/2.0' },
-      signal: controller.signal
-    });
-    if (!response.ok) throw new Error(`MOEX ISS ответил HTTP ${response.status}`);
-    payload = await response.json();
-  } finally {
-    clearTimeout(timer);
+    payload = await fetchJsonWithRetry(url);
+  } catch (e) {
+    throw new Error(`Не удалось опросить MOEX ISS для ${t}: ${e.message}`);
   }
 
   const boards = payload?.boards;
@@ -200,9 +232,13 @@ async function openClient() {
 
 module.exports = {
   SEED,
+  FUTOI_SECID,
+  FUTOI_MIN_DATE,
   normalizeTicker,
   validateTicker,
   candlesUrl,
+  futoiSecid,
+  futoiUrl,
   ensureSchema,
   listTickers,
   getTicker,

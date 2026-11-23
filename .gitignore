@@ -33,6 +33,7 @@ models_test_run.log
 # IDE
 .vscode/
 .idea/
+.qoder/
 *.swp
 *.swo
 *~

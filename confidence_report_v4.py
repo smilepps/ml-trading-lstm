@@ -11,8 +11,8 @@ import psycopg2
 
 import train_gpu as T
 
-TICKER = "IMOEX"
-INTERVALS = ["5m", "10m", "15m", "30m", "60m", "1D"]
+INTERVALS = ["1m", "10m", "60m", "1D"]
+TICKER = os.environ.get("TICKER", "IMOEX")
 MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 TMP = os.path.join(tempfile.gettempdir(), "opencode")
 os.makedirs(TMP, exist_ok=True)
@@ -52,24 +52,34 @@ def load_scaler(interval):
 def evaluate(interval, conn):
     candles = T.load_candles(conn, interval, TICKER, quiet=True)
     scaler = load_scaler(interval)
-    base_norm, _ = T.normalize_candles(candles, scaler)
+    with_oi = "yur_net_mean" in scaler
+    oi = T.load_oi(conn, TICKER) if with_oi else None
+    if with_oi:
+        T.attach_oi(candles, interval, oi)
+    base_norm = T.normalize_candles(candles, scaler)
 
-    contexts = []
+    ctx_items = {}
     for ci in T.CONTEXT_MAP.get(interval, []):
         ctx_candles = T.load_candles(conn, ci, TICKER, quiet=True)
         ctx_scaler = load_scaler(ci)
-        ctx_norm, _ = T.normalize_candles(ctx_candles, ctx_scaler)
-        contexts.append({
-            "interval": ci,
-            "candles": ctx_candles,
-            "normalized": ctx_norm,
-            "begins": [c["begin"] for c in ctx_candles],
-            "scaler": ctx_scaler,
-        })
+        if "yur_net_mean" in ctx_scaler:
+            T.attach_oi(ctx_candles, ci, oi)
+        ctx_items[ci] = (
+            ctx_candles,
+            T.normalize_candles(ctx_candles, ctx_scaler),
+            T.context_begins(ctx_candles),
+        )
 
-    Xs, y, dates, skipped = T.create_dataset(
-        base_norm, candles, T.WINDOW_SIZE, T.HORIZON, T.THRESHOLD, contexts, interval
-    )
+    ctx_begins_map = {ci: item[2] for ci, item in ctx_items.items()}
+    anchors, y, dates, skipped = T.scan_samples(interval, candles, ctx_begins_map)
+    samples = T.build_windows(interval, candles, base_norm, ctx_items, anchors)
+    if not samples:
+        raise RuntimeError(f"{interval}: пустой датасет — переобучите модель")
+
+    Xs = [
+        np.stack([sample[b] for sample in samples]).astype(np.float32)
+        for b in range(1 + len(ctx_items))
+    ]
     n = len(y)
     src = os.path.join(MODELS, f"model_{TICKER}_{interval}.onnx")
     dst = os.path.join(TMP, f"model_{TICKER}_{interval}_dyn.onnx")
@@ -92,13 +102,13 @@ def evaluate(interval, conn):
         "candles": len(candles),
         "labeled": n,
         "skipped_context": skipped,
-        "inputs": 1 + len(contexts),
-        "contexts": T.CONTEXT_MAP.get(interval, []),
+        "inputs": 1 + len(ctx_items),
+        "contexts": list(ctx_items.keys()),
         "splits": {},
     }
     for name, (a, b) in splits.items():
         p = run(a, b)
-        yy = y[a:b]
+        yy = np.asarray(y[a:b], dtype=np.float32)
         conf = np.maximum(p, 1.0 - p)
         mask = conf > 0.60
         item = {

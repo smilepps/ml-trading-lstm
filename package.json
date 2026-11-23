@@ -1,4 +1,4 @@
-{
+ {
   "name": "ml-trading",
   "version": "2.0.0",
   "description": "Многотаймфреймовый LSTM-прогноз движения цены по свечам MOEX: 300 base + 2×300 старших интервалов",
@@ -7,15 +7,13 @@
     "start": "node server.js",
     "tickers": "node tickers.js",
     "refresh-data": "node refresh_data.js",
-    "build-intervals": "node build_intervals.js",
-    "refresh": "node refresh_data.js && node build_intervals.js",
-    "train:gpu": "python train_gpu.py --threshold 0.003",
-    "train:gpu:05": "python train_gpu.py --threshold 0.005",
-    "train:gpu:10": "python train_gpu.py --threshold 0.010",
-    "monitor": "node monitor.js",
-    "predict": "node predict.js"
-    "confidence": "python confidence_report_v4.py",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "refresh": "node refresh_data.js",
+    "train:gpu": "node run_python.js train_gpu.py --threshold 0.003",
+    "train:gpu:05": "node run_python.js train_gpu.py --threshold 0.005",
+    "train:gpu:10": "node run_python.js train_gpu.py --threshold 0.010",
+    "predict": "node predict.js",
+    "confidence": "node run_python.js confidence_report_v4.py",
+    "test": "node --test test"
   },
   "keywords": [
     "lstm",
@@ -27,9 +25,6 @@
   "author": "Сергей Валерьевич Бессонов <dwsads@gmail.com> (https://t.me/smilepps)",
   "license": "ISC",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.2",
-    "@woyax/mcp-max-messenger": "^1.2.2",
-    "brain.js": "^2.0.0-beta.24",
     "dotenv": "^18.0.9",
     "express": "^4.22.3",
     "onnxruntime-node": "^1.31.1",

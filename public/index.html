@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LSTM — вероятность движения цены</title>
+<title>ML-прогноз — вероятность движения цены</title>
 <style>
 :root {
   --bg: #0c0c0e;
@@ -87,6 +87,8 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
 .pill { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 0.76rem; font-weight: 700; letter-spacing: 0.3px; }
 .pill.up { background: rgba(111,191,148,0.1); color: var(--up); border: 1px solid rgba(111,191,148,0.28); }
 .pill.down { background: rgba(212,122,114,0.1); color: var(--down); border: 1px solid rgba(212,122,114,0.28); }
+.target-up { background: rgba(111,191,148,0.18); color: var(--up); border: 1px solid rgba(111,191,148,0.35); }
+.target-down { background: rgba(212,122,114,0.18); color: var(--down); border: 1px solid rgba(212,122,114,0.35); }
 .empty { text-align: center; padding: 30px; color: var(--muted); }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.72rem; background: var(--surface-3); color: var(--muted); margin-left: 6px; border: 1px solid transparent; }
 .badge.ok { background: rgba(111,191,148,0.1); color: var(--up); border-color: rgba(111,191,148,0.28); }
@@ -138,7 +140,7 @@ details.sample-wrap[open] > summary::before { content: "▾"; }
 </head>
 <body>
 
-<h1>LSTM — вероятность движения <span id="headTicker">—</span></h1>
+<h1>ML-прогноз — вероятность движения <span id="headTicker">—</span></h1>
 
 <div class="toolbar">
   <div>
@@ -174,13 +176,14 @@ details.sample-wrap[open] > summary::before { content: "▾"; }
     <button class="btn" id="btnRefresh">Загрузить свечи</button>
     <button class="btn primary" id="btnTrain">Обучить модели</button>
     <button class="btn" id="btnMonitor">Монитор</button>
+    <button class="btn danger" id="btnRestartServer" title="Перезапустить сервер">Перезапуск сервера</button>
   </div>
 </div>
 
 <div class="kv" style="margin-bottom:14px;">
   <div><span class="l">Цена</span><span class="v" id="priceVal">—</span></div>
   <div><span class="l">Последняя свеча</span><span class="v" id="lastCandleVal" style="font-size:0.9rem;">—</span></div>
-  <div><span class="l">Порог</span><span class="v" id="thresholdVal">±0.3%</span></div>
+  <div><span class="l">Порог</span><span class="v" id="thresholdVal">±0.3%</span><span id="thresholdDetail" style="display:block;color:var(--muted);font-size:0.7rem;font-weight:400;margin-top:2px;line-height:1.35;"></span></div>
   <div><span class="l">Горизонт</span><span class="v" id="horizonVal">10 свеч</span></div>
   <div><span class="l">Вход</span><span class="v" id="inputVal">—</span></div>
 </div>
@@ -199,8 +202,9 @@ details.sample-wrap[open] > summary::before { content: "▾"; }
       <th>Интервал</th>
       <th>Close</th>
       <th>Свеча</th>
-      <th>P(Up <span id="thUp">≥0.3%</span>)</th>
-      <th>P(Down <span id="thDown">≤0.3%</span>)</th>
+      <th>P(Up)</th>
+      <th>P(не UP)</th>
+      <th>Порог</th>
       <th>Направление</th>
       <th>Уверенность</th>
       <th>Вход</th>
@@ -238,6 +242,7 @@ details.sample-wrap[open] > summary::before { content: "▾"; }
     <span class="spacer"></span>
     <button class="btn small" id="btnDownloadLog">Скачать</button>
     <button class="btn small" id="btnClearLog">Очистить</button>
+    <button class="btn small" id="btnCopyLog">Копировать лог</button>
   </div>
   <div class="log" id="log"></div>
 </div>
@@ -259,7 +264,9 @@ const btnRefresh = document.getElementById('btnRefresh');
 const btnPredict = document.getElementById('btnPredict');
 const btnAddTicker = document.getElementById('btnAddTicker');
 const btnDeleteTicker = document.getElementById('btnDeleteTicker');
+const btnRestartServer = document.getElementById('btnRestartServer');
 const btnClearLog = document.getElementById('btnClearLog');
+const btnCopyLog = document.getElementById('btnCopyLog');
 const btnDownloadLog = document.getElementById('btnDownloadLog');
 const btnSample = document.getElementById('btnSample');
 const btnSelectAll = document.getElementById('btnSelectAll');
@@ -278,8 +285,7 @@ const inputVal = document.getElementById('inputVal');
 const horizonInput = document.getElementById('horizonInput');
 const horizonVal = document.getElementById('horizonVal');
 const thresholdVal = document.getElementById('thresholdVal');
-const thUp = document.getElementById('thUp');
-const thDown = document.getElementById('thDown');
+const thresholdDetail = document.getElementById('thresholdDetail');
 
 let TICKERS = [];
 let activeTicker = null;
@@ -291,6 +297,7 @@ let trainPoll = null;
 let refreshPoll = null;
 let refreshWasRunning = false;
 let logLines = 0;
+const MAX_LOG_LINES = 1000;
 let config = {
   windowSize: 300,
   features: 7,
@@ -301,6 +308,85 @@ let config = {
   threshold: 0.003
 };
 const predictionsMap = new Map();
+const intervalsMap = new Map(); // interval -> строка /api/intervals (свечи + состояние модели)
+
+// Сервер различает «модели нет» (нет файлов) и «модель сломана» (файлы есть,
+// но несовместимы: например скейлер ждёт контекст 15m). Раньше фронтенд видел
+// только hasModel и рисовал «Нет модели» в обоих случаях, а интервал без
+// прогноза вообще не попадал в таблицу.
+const MODEL_REASON_TEXT = {
+  missing_scaler: 'нет скейлера',
+  broken_scaler: 'скейлер повреждён',
+  missing_context_scaler: 'нет скейлера контекста',
+  missing_model: 'модель не обучена',
+  broken_model: 'модель не загружается',
+  predict_failed: 'прогноз не посчитан',
+  unsupported_interval: 'интервал не поддерживается',
+};
+
+function modelStatusOf(interval, prediction) {
+  if (prediction && prediction.modelStatus) return prediction.modelStatus;
+  const info = intervalsMap.get(interval);
+  if (prediction && prediction.error) {
+    return {
+      ok: info ? !!info.hasModel : false,
+      reason: prediction.errorReason || (info && info.modelStatus ? info.modelStatus.reason : 'predict_failed'),
+      error: prediction.error,
+    };
+  }
+  if (info) {
+    return {
+      ok: !!info.hasModel,
+      reason: info.modelStatus ? info.modelStatus.reason : (info.hasModel ? 'ok' : 'missing_model'),
+      error: info.modelStatus ? info.modelStatus.error : null,
+    };
+  }
+  if (prediction && typeof prediction.hasModel === 'boolean') {
+    return { ok: prediction.hasModel, reason: prediction.hasModel ? 'ok' : 'missing_model', error: null };
+  }
+  return { ok: true, reason: 'ok', error: null };
+}
+
+function modelReasonText(status) {
+  if (!status || status.ok) return '';
+  // Сообщение сервера уже называет причину («Скейлер контекста не найден: ...»),
+  // ярлык нужен только когда сервера сообщение пустое.
+  if (status.error) return String(status.error);
+  return MODEL_REASON_TEXT[status.reason] || status.reason || 'модель недоступна';
+}
+
+// Короткая подпись для бейджа «Модель». «Нет модели» = файлов модели нет вовсе,
+// «Модель сломана» = файлы есть, но связка неполна или несовместима.
+const MODEL_REASON_SHORT = {
+  missing_model: 'Нет модели',
+  unsupported_interval: 'Нет модели',
+  missing_scaler: 'Модель сломана',
+  missing_context_scaler: 'Модель сломана',
+  broken_scaler: 'Модель сломана',
+  broken_model: 'Модель сломана',
+  predict_failed: 'Ошибка',
+  pending: 'Нет прогноза',
+};
+
+// Строка для интервала, по которому прогноза нет (монитор его пропустил):
+// показываем свечи и причину, вместо того чтобы прятать интервал.
+function statusRow(interval) {
+  const info = intervalsMap.get(interval);
+  if (!info) return null;
+  const status = modelStatusOf(interval, null);
+  const pending = status.ok;
+  return {
+    interval,
+    ticker: activeTicker,
+    pending,
+    error: modelReasonText(status) || 'прогноз ещё не рассчитан',
+    errorReason: pending ? 'pending' : status.reason,
+    modelStatus: status,
+    threshold: config.threshold,
+    lastBegin: info.last || null,
+    updatedAt: null,
+  };
+}
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -328,7 +414,11 @@ function appendLog(line) {
   m.textContent = line.msg;
   div.append(t, l, m);
   logEl.appendChild(div);
-  logLines += 1;
+  // Держим DOM ограниченным: SSE может работать сутками.
+  while (logEl.childElementCount > MAX_LOG_LINES) {
+    logEl.firstElementChild.remove();
+  }
+  logLines = logEl.childElementCount;
   logCountEl.textContent = `${logLines.toLocaleString('ru-RU')} строк`;
   if (logAutoEl.checked) logEl.scrollTop = logEl.scrollHeight;
 }
@@ -352,19 +442,47 @@ async function fetchJson(url, options) {
 
 function renderRow(p) {
   const tr = document.createElement('tr');
-  const hasError = !!p.error;
-  const dirCls = p.direction === 'UP' ? 'up' : (p.direction === 'DOWN' ? 'down' : 'flat');
+  const status = modelStatusOf(p.interval, p);
+  const modelProblem = !status.ok;
+  // Модель есть, но прогноз по этому интервалу ещё не посчитан.
+  const pending = !modelProblem && !!p.pending;
+  const hasError = !pending && (modelProblem || !!p.error);
   const hasPrice = Number.isFinite(Number(p.lastClose)) && Number(p.lastClose) > 0;
   const threshold = Number.isFinite(Number(p.threshold)) ? Number(p.threshold) : config.threshold;
+  const thresholdBase = Number.isFinite(Number(p.thresholdBase)) ? Number(p.thresholdBase) : null;
+  const thresholdMultiplier = Number.isFinite(Number(p.thresholdMultiplier)) ? Number(p.thresholdMultiplier) : null;
+  const dirCls = p.direction === 'UP' ? 'up' : (p.direction === 'DOWN' ? 'down' : 'flat');
+  // Подсветка следует за направлением сервера (pUp > 0.55), а не за
+  // произвольным порогом confidence в интерфейсе.
+  const upTargetCls = p.direction === 'UP' ? 'target-up' : '';
+  const downTargetCls = p.direction === 'DOWN' ? 'target-down' : '';
   const upTarget = hasPrice ? (Number(p.lastClose) * (1 + threshold)).toFixed(2) : '—';
   const downTarget = hasPrice ? (Number(p.lastClose) * (1 - threshold)).toFixed(2) : '—';
+  const thresholdTitle = [
+    thresholdBase != null ? `база ±${(thresholdBase * 100).toFixed(2)}%` : null,
+    thresholdMultiplier != null ? `множитель ×${thresholdMultiplier}` : null,
+    p.thresholdHorizon != null ? `горизонт ${p.thresholdHorizon}` : null,
+    p.thresholdSource ? `источник ${p.thresholdSource}` : null,
+    p.thresholdProgressive != null ? (p.thresholdProgressive ? 'прогрессивный' : 'фиксированный') : null,
+  ].filter(Boolean).join(' · ');
   const updated = p.updatedAt ? timeOf(p.updatedAt) : '—';
-  const shortStatus = hasError ? (String(p.error).includes('Модель') ? 'Нет модели' : 'Ошибка') : 'OK';
-  const statusCls = hasError ? 'badge err' : 'badge ok';
-  const statusTitle = hasError ? esc(p.error) : 'Модель загружена';
+  const shortStatus = modelProblem
+    ? (MODEL_REASON_SHORT[status.reason] || 'Модель сломана')
+    : pending ? 'Нет прогноза'
+    : hasError ? (MODEL_REASON_SHORT[p.errorReason] || 'Ошибка') : 'OK';
+  const statusCls = modelProblem || hasError ? 'badge err' : (pending ? 'badge warn' : 'badge ok');
+  const statusTitle = modelProblem || hasError
+    ? esc(modelReasonText(status) || p.error || status.error || 'Ошибка')
+    : (pending ? 'Модель загружена, прогноз ещё не рассчитан' : 'Модель загружена');
   const inputs = Number(p.inputs) || 1;
   const contexts = Array.isArray(p.contexts) && p.contexts.length ? p.contexts.join('+') : 'нет';
-  const inputText = hasError ? '—' : `${inputs}×${p.window || config.windowSize}×${p.features || config.features} <span class="small">(${esc(contexts)})</span>`;
+  const inputText = hasError || pending ? '—' : `${inputs}×${p.window || config.windowSize}×${p.features || config.features} <span class="small">(${esc(contexts)})</span>`;
+  // Категория («Нет модели» / «Модель сломана») плюс короткая причина рядом,
+  // чтобы ошибка была видна без наведения мыши.
+  const problemReason = modelProblem ? status.reason : (hasError ? (p.errorReason || 'predict_failed') : null);
+  const problemDetail = problemReason
+    ? ` <span class="small">${esc(MODEL_REASON_TEXT[problemReason] || problemReason)}</span>`
+    : '';
 
   tr.innerHTML = `
     <td><code>${esc(p.interval)}</code></td>
@@ -372,13 +490,14 @@ function renderRow(p) {
     <td class="small">${esc(p.lastBegin || '—')}</td>
     <td>${Number.isFinite(Number(p.pUp)) ? (Number(p.pUp) * 100).toFixed(1) + '%' : '—'}</td>
     <td>${Number.isFinite(Number(p.pDown)) ? (Number(p.pDown) * 100).toFixed(1) + '%' : '—'}</td>
+    <td class="small" title="${esc(thresholdTitle)}">${(threshold * 100).toFixed(2)}%${thresholdMultiplier != null && thresholdMultiplier !== 1 ? ` <span class="small">×${thresholdMultiplier}</span>` : ''}</td>
     <td><span class="pill ${dirCls}">${esc(p.direction || '—')}</span></td>
     <td>${Number.isFinite(Number(p.confidence)) ? (Number(p.confidence) * 100).toFixed(1) + '%' : '—'}</td>
     <td class="small">${inputText}</td>
-    <td class="small">${upTarget}</td>
-    <td class="small">${downTarget}</td>
+    <td class="small ${upTargetCls}">${upTarget}</td>
+    <td class="small ${downTargetCls}">${downTarget}</td>
     <td class="small">${updated}</td>
-    <td><span class="${statusCls}" title="${statusTitle}">${esc(shortStatus)}</span></td>
+    <td><span class="${statusCls}" title="${statusTitle}">${esc(shortStatus)}</span>${problemDetail}</td>
   `;
   return tr;
 }
@@ -389,13 +508,15 @@ function renderTable() {
   let any = false;
   for (const interval of INTERVALS) {
     if (!show.has(interval)) continue;
-    const p = predictionsMap.get(interval);
+    // Пустую строку не прячем: без неё интервал со сломанной моделью
+    // выглядел как «в базе таких свечей нет».
+    const p = predictionsMap.get(interval) || statusRow(interval);
     if (!p) continue;
     any = true;
     tblBody.appendChild(renderRow(p));
   }
   if (!any) {
-    tblBody.innerHTML = '<tr><td colspan="12" class="empty">Нет данных для выбранных интервалов</td></tr>';
+    tblBody.innerHTML = '<tr><td colspan="13" class="empty">Нет данных для выбранных интервалов</td></tr>';
   }
 }
 
@@ -428,7 +549,7 @@ function updateTitles() {
   const item = TICKERS.find(t => t.ticker === activeTicker);
   headTicker.textContent = activeTicker || '—';
   tickerTitle.textContent = item ? `${item.title || ''} · ${item.engine}/${item.market}` : '';
-  document.title = `LSTM — ${activeTicker || ''} — вероятность движения цены`;
+  document.title = `ML-прогноз — ${activeTicker || ''} — вероятность движения цены`;
 }
 
 async function loadTickers(preserveActive = true) {
@@ -467,8 +588,30 @@ async function loadConfig() {
     horizonInput.value = String(config.horizon);
     horizonVal.textContent = `${config.horizon} свеч`;
     thresholdVal.textContent = `±${percentLabel(config.threshold)}`;
-    thUp.textContent = `≥${percentLabel(config.threshold)}`;
-    thDown.textContent = `≤${percentLabel(config.threshold)}`;
+    const details = config.thresholdDetails && typeof config.thresholdDetails === 'object'
+      ? Object.entries(config.thresholdDetails)
+      : [];
+    if (details.length) {
+      // Показываем реальные пороги моделей, а не только глобальный 1m.
+      thresholdDetail.textContent = details
+        .map(([interval, meta]) => {
+          const mult = Number(meta.multiplier);
+          return `${interval} ±${percentLabel(meta.effective)}` +
+            (Number.isFinite(mult) && mult !== 1 ? ` (×${mult})` : '');
+        })
+        .join(' · ');
+      thresholdVal.title = details
+        .map(([interval, meta]) => {
+          const kind = meta.progressive === false ? 'фиксированный' : 'прогрессивный';
+          return `${interval}: база ${percentLabel(meta.base)} × ${meta.multiplier} = ` +
+            `${percentLabel(meta.effective)} (${kind}, источник ${meta.source || '—'})`;
+        })
+        .join('\n');
+    } else {
+      thresholdDetail.textContent = config.baseThreshold != null
+        ? `база ±${percentLabel(config.baseThreshold)}`
+        : '';
+    }
   } catch (e) {
     log('Ошибка загрузки конфигурации: ' + e.message, 'error');
   }
@@ -488,20 +631,25 @@ async function loadIntervals(preserveSelection = false) {
     const data = await fetchJson('/api/intervals?ticker=' + encodeURIComponent(activeTicker || ''));
     if (!Array.isArray(data)) throw new Error(data.error || 'некорректный ответ');
     INTERVALS = data.map(d => d.interval);
+    intervalsMap.clear();
+    for (const d of data) intervalsMap.set(d.interval, d);
     intervalsSel.innerHTML = '';
     sampleInterval.innerHTML = '';
     for (const d of data) {
+      const reasonText = d.hasModel ? '' : modelReasonText(modelStatusOf(d.interval, null));
       const o = document.createElement('option');
       o.value = d.interval;
       const count = d.candles != null ? ` — ${Number(d.candles).toLocaleString('ru-RU')} свечей` : '';
-      const last = d.last ? `, до ${d.last}` : '';
-      o.textContent = `${d.interval}${count}${last}${d.hasModel ? '' : ' ⚠ нет модели'}`;
+      const range = d.first && d.last ? ` (${d.first} → ${d.last})` : '';
+      o.textContent = `${d.interval}${count}${range}${d.hasModel ? '' : ` ⚠ ${reasonText || 'нет модели'}`}`;
+      if (!d.hasModel) o.title = reasonText || 'модель не найдена';
       o.selected = prev ? prev.has(d.interval) : true;
       intervalsSel.appendChild(o);
 
       const so = document.createElement('option');
       so.value = d.interval;
-      so.textContent = d.interval + (d.hasModel ? '' : ' (нет модели)');
+      const rangeText = d.first && d.last ? ` (${d.first} → ${d.last})` : '';
+      so.textContent = d.interval + rangeText + (d.hasModel ? '' : ` (${reasonText || 'нет модели'})`);
       sampleInterval.appendChild(so);
     }
     syncSelected();
@@ -510,6 +658,8 @@ async function loadIntervals(preserveSelection = false) {
       syncSelected();
     }
     for (const d of data) {
+      // Прогноз из /api/intervals — это кэш монитора. Если его нет, строку
+      // всё равно показываем (statusRow), чтобы не прятать сломанную модель.
       if (d.prediction) predictionsMap.set(d.interval, d.prediction);
     }
     if (sampleInterval.options.length) {
@@ -550,6 +700,7 @@ async function selectTicker(ticker) {
   activeTicker = ticker;
   tickerSel.value = ticker;
   predictionsMap.clear();
+  intervalsMap.clear();
   selectedIntervals = [];
   updateTitles();
   await loadConfig();
@@ -602,7 +753,7 @@ async function train() {
   }
 }
 
-async function refreshCandles() {
+async function refreshCandles(wait = false) {
   if (!activeTicker) return;
   btnRefresh.disabled = true;
   try {
@@ -612,7 +763,11 @@ async function refreshCandles() {
       body: JSON.stringify({ ticker: activeTicker })
     });
     log(`Загрузка свечей ${activeTicker}: ${res.queued ? 'в очереди' : 'запущена'} (${res.mode})`);
-    pollRefresh();
+    if (wait) {
+      await pollRefresh();
+    } else {
+      pollRefresh();
+    }
   } catch (e) {
     log('Ошибка загрузки свечей: ' + e.message, 'error');
     btnRefresh.disabled = false;
@@ -638,7 +793,7 @@ async function addTicker() {
     await loadTickers(false);
     tickerSel.value = res.ticker;
     await selectTicker(res.ticker);
-    pollRefresh();
+    await pollRefresh();
   } catch (e) {
     log('Не удалось добавить тикер: ' + e.message, 'error');
   } finally {
@@ -670,6 +825,18 @@ async function toggleMonitor() {
   }
 }
 
+async function restartServer() {
+  if (!confirm('Перезапустить сервер? Дашборт будет недоступен на время перезапуска.')) return;
+  btnRestartServer.disabled = true;
+  try {
+    const res = await fetchJson('/api/server/restart', { method: 'POST' });
+    log('Сервер перезапускается…', 'warn');
+  } catch (e) {
+    log('Не удалось перезапустить сервер: ' + e.message, 'error');
+    btnRestartServer.disabled = false;
+  }
+}
+
 async function refreshMonitorStatus() {
   try {
     const s = await fetchJson('/api/monitor/status');
@@ -685,34 +852,37 @@ async function refreshMonitorStatus() {
 }
 
 async function pollRefresh() {
-  if (refreshPoll) return;
-  const tick = async () => {
-    try {
-      const s = await fetchJson('/api/refresh/status');
-      if (s.running && s.current) {
+  if (refreshPoll) return refreshPoll;
+
+  refreshPoll = (async () => {
+    while (true) {
+      try {
+        const s = await fetchJson('/api/refresh/status');
+        if (!s.running) break;
         const c = s.current;
         setBadge(refreshStatus, `${c.step}${c.currentTicker ? ': ' + c.currentTicker : ''}`, 'warn');
         btnRefresh.disabled = true;
         refreshWasRunning = true;
-        return;
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (e) {
+        break;
       }
-      clearInterval(refreshPoll);
-      refreshPoll = null;
-      btnRefresh.disabled = false;
-      setBadge(refreshStatus, 'Готовы', 'ok');
-      if (refreshWasRunning) {
-        refreshWasRunning = false;
-        log('Загрузка свечей завершена');
-        await loadTickers(true);
-        await loadConfig();
-        await loadIntervals(true);
-        await fetchPredict();
-        await loadSample();
-      }
-    } catch (e) { /* ignore */ }
-  };
-  refreshPoll = setInterval(tick, 2000);
-  await tick();
+    }
+    refreshPoll = null;
+    btnRefresh.disabled = false;
+    setBadge(refreshStatus, 'Готовы', 'ok');
+    if (refreshWasRunning) {
+      refreshWasRunning = false;
+      log('Загрузка свечей завершена');
+      await loadTickers(true);
+      await loadConfig();
+      await loadIntervals(true);
+      await fetchPredict();
+      await loadSample();
+    }
+  })();
+
+  return refreshPoll;
 }
 
 function percentLabel(value) {
@@ -729,7 +899,7 @@ async function loadSample() {
     const s = await fetchJson(`/api/sample?ticker=${encodeURIComponent(activeTicker)}&interval=${encodeURIComponent(interval)}`);
     const shape = Object.entries(s.shape || {}).map(([k, v]) => `${k}: ${v[0]}×${v[1]}`).join(' | ');
     sampleInfo.innerHTML = `
-      <b>${esc(s.ticker)} ${esc(s.interval)}</b> · окно ${esc(s.window)} · горизонт ${esc(s.horizon)} · порог ${percentLabel(s.threshold)} · порядок: <code>${esc(s.order)}</code><br>
+      <b>${esc(s.ticker)} ${esc(s.interval)}</b> · окно ${esc(s.window)} · горизонт ${esc(s.horizon)} · порог ${percentLabel(s.threshold)}${s.thresholdMultiplier != null ? ` (×${esc(s.thresholdMultiplier)})` : ''} · порядок: <code>${esc(s.order)}</code><br>
       Форма входа: <code>${esc(shape)}</code> · контексты: <code>${esc((s.contexts || []).join(', ') || 'нет')}</code><br>
       Признаки (${s.featureNames.length}): ${s.featureNames.map((n, i) => `<code title="${esc(s.featureDescriptions[n] || '')}">${esc(n)}</code>`).join(', ')}
     `;
@@ -797,6 +967,7 @@ btnMonitor.addEventListener('click', async () => {
     log('Ошибка монитора: ' + e.message, 'error');
   }
 });
+btnRestartServer.addEventListener('click', restartServer);
 logDebugEl.addEventListener('change', () => {
   logEl.classList.toggle('show-debug', logDebugEl.checked);
   if (logDebugEl.checked) logEl.scrollTop = logEl.scrollHeight;
@@ -805,6 +976,20 @@ btnClearLog.addEventListener('click', () => {
   logEl.innerHTML = '';
   logLines = 0;
   logCountEl.textContent = '0 строк';
+});
+
+btnCopyLog.addEventListener('click', async () => {
+  const text = Array.from(logEl.querySelectorAll('.log-line')).map(el => el.textContent).join('\n');
+  if (!text) {
+    log('Лог пуст, нечего копировать', 'warn');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    log('Лог скопирован в буфер обмена');
+  } catch (e) {
+    log('Не удалось скопировать лог: ' + e.message, 'error');
+  }
 });
 btnDownloadLog.addEventListener('click', () => {
   const text = Array.from(logEl.querySelectorAll('.log-line')).map(el => el.textContent).join('\n');
